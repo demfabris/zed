@@ -1100,6 +1100,15 @@ impl WgpuRenderer {
         &self.atlas
     }
 
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn device_context(&self) -> Option<gpui::WgpuDeviceContext> {
+        let resources = &self.core()?.resources;
+        Some(gpui::WgpuDeviceContext {
+            device: resources.device.clone(),
+            queue: resources.queue.clone(),
+        })
+    }
+
     pub fn supports_dual_source_blending(&self) -> bool {
         self.core().is_some_and(|core| core.dual_source_blending)
     }
