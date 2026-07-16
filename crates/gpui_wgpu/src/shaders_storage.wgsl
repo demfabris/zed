@@ -40,3 +40,9 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
     return b_poly_sprites[instance_id];
 }
+
+@group(1) @binding(0) var<storage, read> b_surfaces: array<SurfaceParams>;
+
+fn load_surface(instance_id: u32) -> SurfaceParams {
+    return b_surfaces[instance_id];
+}
