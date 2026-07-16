@@ -2,6 +2,8 @@
 use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use crate::WgpuDeviceContext;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -2580,6 +2582,12 @@ impl Window {
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
+    }
+
+    /// Returns the device and queue used by this window's wgpu renderer.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn wgpu_device_context(&self) -> Option<WgpuDeviceContext> {
+        self.platform_window.wgpu_device_context()
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the

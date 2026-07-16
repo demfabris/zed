@@ -159,6 +159,9 @@ pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub use wgpu;
+
 pub use pollster::block_on;
 
 /// The context trait, allows the different contexts in GPUI to be used

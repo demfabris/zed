@@ -731,6 +731,16 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+/// The device and queue used by GPUI's wgpu renderer.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[derive(Clone, Debug)]
+pub struct WgpuDeviceContext {
+    /// The renderer's current device.
+    pub device: Arc<wgpu::Device>,
+    /// The renderer's current queue.
+    pub queue: Arc<wgpu::Queue>,
+}
+
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
 ///
 /// `Inactive` means visible but not receiving input (a system dialog on
@@ -912,6 +922,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn wgpu_device_context(&self) -> Option<WgpuDeviceContext> {
+        None
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
