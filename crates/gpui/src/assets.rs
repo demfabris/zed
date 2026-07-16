@@ -75,6 +75,14 @@ impl RenderImage {
             .map(|frame| frame.buffer().as_raw().as_slice())
     }
 
+    /// Consume this image, returning its underlying frames.
+    ///
+    /// Lets a caller holding the last reference reclaim the frame buffers
+    /// (e.g. to recycle large streaming allocations) instead of dropping them.
+    pub fn into_frames(self) -> SmallVec<[Frame; 1]> {
+        self.data
+    }
+
     /// Get the size of this image, in pixels.
     pub fn size(&self, frame_index: usize) -> Size<DevicePixels> {
         self.data
