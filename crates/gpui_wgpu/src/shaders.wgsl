@@ -81,6 +81,10 @@ struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
     pad: u32,
+    // Scene-wide rounded clip (Scene::window_corner_mask); zero size disables it.
+    window_mask_origin: vec2<f32>,
+    window_mask_size: vec2<f32>,
+    window_mask_radii: vec4<f32>,
 }
 
 struct GammaParams {
@@ -386,6 +390,24 @@ fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
     }
 }
 
+// Antialiased coverage of the scene-wide rounded window mask at this position.
+// 1.0 everywhere when the mask is disabled (zero size). Drop shadows skip this
+// on purpose: a client-decorated window's shadow lives outside the mask.
+fn window_mask_alpha(position: vec2<f32>) -> f32 {
+    if (globals.window_mask_size.x <= 0.0) {
+        return 1.0;
+    }
+    let mask_bounds = Bounds(globals.window_mask_origin, globals.window_mask_size);
+    let mask_radii = Corners(
+        globals.window_mask_radii.x,
+        globals.window_mask_radii.y,
+        globals.window_mask_radii.z,
+        globals.window_mask_radii.w,
+    );
+    let distance = quad_sdf(position, mask_bounds, mask_radii);
+    return saturate(0.5 - distance);
+}
+
 // Abstract away the final color transformation based on the
 // target alpha compositing mode.
 fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
@@ -584,7 +606,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
             quad.border_widths.right == 0.0 &&
             quad.border_widths.bottom == 0.0 &&
             unrounded) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, window_mask_alpha(input.position.xy));
     }
 
     let size = quad.bounds.size;
@@ -650,7 +672,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // However, that might negatively impact performance in the case of
     // reasonable sizes for rounded corners.
     if (is_within_inner_straight_border && !is_near_rounded_corner) {
-        return blend_color(background_color, 1.0);
+        return blend_color(background_color, window_mask_alpha(input.position.xy));
     }
 
     // Signed distance of the point to the outside edge of the quad's border. It
@@ -889,7 +911,8 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color, saturate(antialias_threshold - outer_sdf));
+    return blend_color(color,
+        saturate(antialias_threshold - outer_sdf) * window_mask_alpha(input.position.xy));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -1141,7 +1164,8 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 @fragment
 fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
-    return sample;
+    // The intermediate texture is premultiplied, so scale all components.
+    return sample * window_mask_alpha(input.position.xy);
 }
 
 // --- underlines --- //
@@ -1191,7 +1215,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let underline = load_underline(input.underline_id);
     if (underline.wavy == 0u)
     {
-        return blend_color(input.color, input.color.a);
+        return blend_color(input.color, input.color.a * window_mask_alpha(input.position.xy));
     }
 
     let half_thickness = underline.thickness * 0.5;
@@ -1207,7 +1231,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
     let distance_from_top_border = distance_in_pixels - half_thickness;
     let distance_from_bottom_border = distance_in_pixels + half_thickness;
     let alpha = saturate(0.5 - max(-distance_from_bottom_border, distance_from_top_border));
-    return blend_color(input.color, alpha * input.color.a);
+    return blend_color(input.color, alpha * input.color.a * window_mask_alpha(input.position.xy));
 }
 
 // --- monochrome sprites --- //
@@ -1254,7 +1278,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return blend_color(input.color, alpha_corrected);
+    return blend_color(input.color, alpha_corrected * window_mask_alpha(input.position.xy));
 }
 
 // --- polychrome sprites --- //
@@ -1307,7 +1331,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    return blend_color(color,
+        sprite.opacity * saturate(0.5 - distance) * window_mask_alpha(input.position.xy));
 }
 
 // --- surfaces --- //
@@ -1342,5 +1367,10 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    return textureSample(t_sprite, s_sprite, input.texture_position);
+    let sample = textureSample(t_sprite, s_sprite, input.texture_position);
+    let mask = window_mask_alpha(input.position.xy);
+    if (globals.premultiplied_alpha != 0u) {
+        return sample * mask;
+    }
+    return vec4<f32>(sample.rgb, sample.a * mask);
 }

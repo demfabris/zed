@@ -51,6 +51,9 @@ fn fs_subpixel_sprite(input: SubpixelSpriteOutput) -> SubpixelSpriteFragmentOutp
 
     var out = SubpixelSpriteFragmentOutput();
     out.foreground = vec4<f32>(input.color.rgb, 1.0);
-    out.alpha = vec4<f32>(input.color.a * alpha_corrected, 1.0);
+    // Scaling the per-channel coverage by the window mask blends the glyph
+    // toward the destination, clipping it like every other primitive.
+    out.alpha = vec4<f32>(
+        input.color.a * alpha_corrected * window_mask_alpha(input.position.xy), 1.0);
     return out;
 }
