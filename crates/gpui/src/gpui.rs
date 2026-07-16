@@ -164,6 +164,9 @@ pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub use wgpu;
+
 #[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;
 
