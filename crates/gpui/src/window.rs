@@ -20,9 +20,9 @@ use crate::{
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowCornerMask,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1181,6 +1181,7 @@ pub struct Window {
     pub(crate) pending_input_observers: SubscriberSet<(), AnyObserver>,
     prompt: Option<RenderablePromptHandle>,
     pub(crate) client_inset: Option<Pixels>,
+    window_corner_mask: Option<(Bounds<Pixels>, Corners<Pixels>)>,
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
@@ -1859,6 +1860,7 @@ impl Window {
             pending_input_observers: SubscriberSet::new(),
             prompt: None,
             client_inset: None,
+            window_corner_mask: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2503,6 +2505,18 @@ impl Window {
         self.client_inset
     }
 
+    /// Clips everything this window draws, except drop shadows, to the given rounded
+    /// rectangle. Client-side-decorated windows use this to keep square-edged content
+    /// (scrollbars, embedded surfaces) from escaping their rounded frame; drop shadows
+    /// are exempt because the frame's own shadow lives outside the mask. The mask
+    /// persists across frames until changed; pass `None` to disable.
+    pub fn set_window_corner_mask(&mut self, mask: Option<(Bounds<Pixels>, Corners<Pixels>)>) {
+        if self.window_corner_mask != mask {
+            self.window_corner_mask = mask;
+            self.refresh();
+        }
+    }
+
     /// Returns whether the title bar window controls need to be rendered by the application (Wayland and X11)
     pub fn window_decorations(&self) -> Decorations {
         self.platform_window.window_decorations()
@@ -2870,6 +2884,13 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        let scale_factor = self.scale_factor();
+        self.rendered_frame.scene.window_corner_mask =
+            self.window_corner_mask
+                .map(|(bounds, corner_radii)| WindowCornerMask {
+                    bounds: bounds.scale(scale_factor),
+                    corner_radii: corner_radii.scale(scale_factor),
+                });
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;

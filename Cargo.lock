@@ -7911,6 +7911,7 @@ dependencies = [
  "waker-fn",
  "wasm-bindgen",
  "web-time",
+ "wgpu",
  "windows 0.61.3",
  "zed-font-kit",
  "zed-scap",

@@ -36,12 +36,25 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
+/// A rounded rectangle that every primitive in a scene except drop shadows is
+/// clipped to. Client-side-decorated windows use this to keep square-edged
+/// content (scrollbars, embedded surfaces) inside their rounded frame; shadows
+/// are exempt because the frame's own drop shadow lives outside the mask.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowCornerMask {
+    /// The rectangle content is clipped to, in scaled pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The corner radii of the clip rectangle, in scaled pixels.
+    pub corner_radii: Corners<ScaledPixels>,
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    pub window_corner_mask: Option<WindowCornerMask>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -58,6 +71,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.window_corner_mask = None;
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();

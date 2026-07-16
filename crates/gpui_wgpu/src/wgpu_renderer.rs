@@ -61,6 +61,10 @@ struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
     pad: u32,
+    // Scene-wide rounded clip (Scene::window_corner_mask); zero size disables it.
+    window_mask_origin: [f32; 2],
+    window_mask_size: [f32; 2],
+    window_mask_radii: [f32; 4],
 }
 
 #[repr(C)]
@@ -1321,6 +1325,7 @@ impl WgpuRenderer {
             _pad: 0,
         };
 
+        let window_mask = scene.window_corner_mask.unwrap_or_default();
         let globals = GlobalParams {
             viewport_size: [
                 self.surface_config.width as f32,
@@ -1334,6 +1339,17 @@ impl WgpuRenderer {
                 0
             },
             pad: 0,
+            window_mask_origin: [window_mask.bounds.origin.x.0, window_mask.bounds.origin.y.0],
+            window_mask_size: [
+                window_mask.bounds.size.width.0,
+                window_mask.bounds.size.height.0,
+            ],
+            window_mask_radii: [
+                window_mask.corner_radii.top_left.0,
+                window_mask.corner_radii.top_right.0,
+                window_mask.corner_radii.bottom_right.0,
+                window_mask.corner_radii.bottom_left.0,
+            ],
         };
 
         let path_globals = GlobalParams {
