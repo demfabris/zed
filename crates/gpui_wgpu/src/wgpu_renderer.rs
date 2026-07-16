@@ -1,6 +1,8 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use gpui::PaintSurface;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
@@ -62,12 +64,14 @@ struct GlobalParams {
 }
 
 #[repr(C)]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct PodBounds {
     origin: [f32; 2],
     size: [f32; 2],
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl From<Bounds<ScaledPixels>> for PodBounds {
     fn from(bounds: Bounds<ScaledPixels>) -> Self {
         Self {
@@ -78,6 +82,7 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 }
 
 #[repr(C)]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
@@ -158,7 +163,6 @@ struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
-    surfaces: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -688,55 +692,10 @@ impl WgpuRenderer {
             ],
         });
 
-        let surfaces = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("surfaces_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: NonZeroU64::new(
-                            std::mem::size_of::<SurfaceParams>() as u64
-                        ),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
         WgpuBindGroupLayouts {
             globals,
             instances,
             texture,
-            surfaces,
         }
     }
 
@@ -1046,8 +1005,8 @@ impl WgpuRenderer {
             "vs_surface",
             "fs_surface",
             &layouts.globals,
-            &layouts.surfaces,
-            None,
+            &layouts.instances,
+            Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
@@ -1535,9 +1494,12 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                    PrimitiveBatch::Surfaces(range) => {
+                        self.draw_surfaces(&scene.surfaces[range], &mut instance_offset, &mut pass)?
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                    PrimitiveBatch::Surfaces(_) => {}
                 }
             }
         }
@@ -1609,6 +1571,35 @@ impl WgpuRenderer {
                     },
                 ],
             })
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn draw_surfaces(
+        &mut self,
+        surfaces: &[PaintSurface],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        for surface in surfaces {
+            let params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+            };
+            let instances =
+                self.write_instance_binding("surfaces_bind_group", instance_offset, &[params])?;
+            let texture = self
+                .create_texture_bind_group("surface_texture_bind_group", &surface.texture_view);
+            let resources = self.resources();
+            pass.set_pipeline(&resources.pipelines.surfaces);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &instances.bind_group, &[]);
+            pass.set_bind_group(2, &texture, &[]);
+            pass.draw(
+                0..4,
+                instances.first_instance..instances.first_instance + 1,
+            );
+        }
+        Ok(())
     }
 
     fn draw_instances(
