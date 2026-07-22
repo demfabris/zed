@@ -433,8 +433,8 @@ impl MacTextSystemState {
         // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
         let mut bounds = bounds.dilate(DevicePixels(1));
         if params.synthetic_bold {
-            let line_width = (f32::from(params.font_size) / 14.0).max(1.0);
-            let padding = ((line_width * params.scale_factor) / 2.0).ceil() as i32;
+            let line_width = synthetic_bold_device_line_width(params.font_size);
+            let padding = (line_width / 2.0).ceil() as i32;
             bounds = bounds.dilate(DevicePixels(padding));
         }
         if params.synthetic_italic {
@@ -510,7 +510,10 @@ impl MacTextSystemState {
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
             if params.synthetic_bold {
                 cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFillStroke);
-                cx.set_line_width((f32::from(params.font_size) / 14.0).max(1.0) as CGFloat);
+                cx.set_line_width(synthetic_bold_user_space_line_width(
+                    params.font_size,
+                    params.scale_factor,
+                ) as CGFloat);
             } else {
                 cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
             }
@@ -654,6 +657,15 @@ impl MacTextSystemState {
     }
 }
 
+fn synthetic_bold_device_line_width(font_size: Pixels) -> f32 {
+    (f32::from(font_size) / 14.0).max(1.0)
+}
+
+fn synthetic_bold_user_space_line_width(font_size: Pixels, scale_factor: f32) -> f32 {
+    debug_assert!(scale_factor > 0.0);
+    synthetic_bold_device_line_width(font_size) / scale_factor
+}
+
 #[derive(Debug, Clone)]
 struct StringIndexConverter<'a> {
     text: &'a str,
@@ -792,8 +804,16 @@ mod lenient_font_attributes {
 
 #[cfg(test)]
 mod tests {
+    use super::{synthetic_bold_device_line_width, synthetic_bold_user_space_line_width};
     use crate::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+
+    #[test]
+    fn synthetic_bold_stays_one_device_pixel_at_retina_scale() {
+        assert_eq!(synthetic_bold_device_line_width(px(13.0)), 1.0);
+        assert_eq!(synthetic_bold_user_space_line_width(px(13.0), 2.0), 0.5);
+        assert_eq!(synthetic_bold_device_line_width(px(28.0)), 2.0);
+    }
 
     #[test]
     fn test_layout_line_bom_char() {
