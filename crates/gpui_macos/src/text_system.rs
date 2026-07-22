@@ -530,7 +530,7 @@ impl MacTextSystemState {
             };
             cx.set_gray_fill_color(luminance, 1.0);
             if params.synthetic_bold {
-                cx.set_gray_stroke_color(luminance, 1.0);
+                cx.set_rgb_stroke_color(luminance, luminance, luminance, 1.0);
             }
             self.fonts[params.font_id.0]
                 .native_font()
