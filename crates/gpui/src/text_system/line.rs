@@ -1,5 +1,5 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
+    App, Bounds, DevicePixels, GlyphRenderOptions, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
     SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
 };
@@ -89,6 +89,28 @@ impl ShapedLine {
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
+        self.paint_with_options(
+            origin,
+            line_height,
+            align,
+            align_width,
+            GlyphRenderOptions::default(),
+            window,
+            cx,
+        )
+    }
+
+    /// Paint the line with per-glyph raster effects.
+    pub fn paint_with_options(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        glyph_options: GlyphRenderOptions,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
         paint_line(
             origin,
             &self.layout,
@@ -97,6 +119,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            glyph_options,
             window,
             cx,
         )?;
@@ -228,6 +251,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            GlyphRenderOptions::default(),
             window,
             cx,
         )
@@ -303,6 +327,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            GlyphRenderOptions::default(),
             window,
             cx,
         )?;
@@ -349,6 +374,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    glyph_options: GlyphRenderOptions,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -542,12 +568,13 @@ fn paint_line(
                             layout.font_size,
                         )?;
                     } else {
-                        window.paint_glyph(
+                        window.paint_glyph_with_options(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
                             color,
+                            glyph_options,
                         )?;
                     }
                 }
