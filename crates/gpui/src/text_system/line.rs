@@ -1,7 +1,7 @@
 use crate::{
-    App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
-    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
-    WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
+    App, Bounds, DevicePixels, GlyphRenderOptions, Half, Hsla, LineLayout, Pixels, Point,
+    RenderGlyphParams, Result, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window,
+    WrapBoundary, WrappedLineLayout, black, fill, point, px, size, underline_y_offset,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
@@ -150,9 +150,36 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            GlyphRenderOptions::default(),
             window,
             cx,
             &mut paint_underline,
+        )
+    }
+
+    /// Paint the line with per-glyph raster effects.
+    pub fn paint_with_options(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
+        glyph_options: GlyphRenderOptions,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<()> {
+        paint_line(
+            origin,
+            &self.layout,
+            line_height,
+            align,
+            align_width,
+            &self.decoration_runs,
+            &[],
+            glyph_options,
+            window,
+            cx,
+            &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
         )
     }
 
@@ -403,6 +430,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            GlyphRenderOptions::default(),
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
@@ -479,6 +507,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            GlyphRenderOptions::default(),
             window,
             cx,
             &mut |_, origin, width, style, window| window.paint_underline(origin, width, style),
@@ -526,6 +555,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    glyph_options: GlyphRenderOptions,
     window: &mut Window,
     cx: &mut App,
     paint_underline: &mut dyn FnMut(
@@ -738,12 +768,13 @@ fn paint_line(
                             layout.font_size,
                         )?;
                     } else {
-                        window.paint_glyph(
+                        window.paint_glyph_with_options(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
                             color,
+                            glyph_options,
                         )?;
                     }
                 }
@@ -1287,6 +1318,7 @@ mod tests {
                     Some(px(16.)),
                     &wrapped.decoration_runs,
                     &wrapped.wrap_boundaries,
+                    GlyphRenderOptions::default(),
                     window,
                     cx,
                     &mut |range, origin, width, style, window| {

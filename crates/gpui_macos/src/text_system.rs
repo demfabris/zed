@@ -13,6 +13,7 @@ use core_graphics::{
     color_space::CGColorSpace,
     context::{CGContext, CGTextDrawingMode},
     display::CGPoint,
+    geometry::CGAffineTransform,
 };
 use core_text::{
     font::CTFont,
@@ -430,7 +431,20 @@ impl MacTextSystemState {
         )?);
 
         // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
-        Ok(bounds.dilate(DevicePixels(1)))
+        let mut bounds = bounds.dilate(DevicePixels(1));
+        if params.synthetic_bold {
+            let line_width = (f32::from(params.font_size) / 14.0).max(1.0);
+            let padding = ((line_width * params.scale_factor) / 2.0).ceil() as i32;
+            bounds = bounds.dilate(DevicePixels(padding));
+        }
+        if params.synthetic_italic {
+            // A symmetric pad keeps the sheared outline inside the atlas tile regardless of
+            // whether a glyph extends above or below the baseline.
+            let padding = (bounds.size.height.0 as f32 * 0.267_949).ceil() as i32;
+            bounds.origin.x -= DevicePixels(padding);
+            bounds.size.width += DevicePixels(padding.saturating_mul(2));
+        }
+        Ok(bounds)
     }
 
     fn rasterize_glyph(
@@ -487,11 +501,19 @@ impl MacTextSystemState {
                 params.scale_factor as CGFloat,
                 params.scale_factor as CGFloat,
             );
+            if params.synthetic_italic {
+                cx.concat_ctm(CGAffineTransform::new(1.0, 0.0, 0.267_949, 1.0, 0.0, 0.0));
+            }
 
             let subpixel_shift = params
                 .subpixel_variant
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
-            cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
+            if params.synthetic_bold {
+                cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFillStroke);
+                cx.set_line_width((f32::from(params.font_size) / 14.0).max(1.0) as CGFloat);
+            } else {
+                cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
+            }
             cx.set_allows_antialiasing(true);
             cx.set_should_antialias(true);
             cx.set_allows_font_subpixel_positioning(true);
@@ -499,12 +521,16 @@ impl MacTextSystemState {
             cx.set_allows_font_subpixel_quantization(false);
             cx.set_should_subpixel_quantize_fonts(false);
 
-            if params.dilation > 0 {
-                let luminance = params.dilation as f64 * 0.25;
-                cx.set_should_smooth_fonts(true);
-                cx.set_gray_fill_color(luminance, 1.0);
+            cx.set_allows_font_smoothing(true);
+            cx.set_should_smooth_fonts(params.font_smoothing);
+            let luminance = if params.font_smoothing {
+                f64::from(params.font_smoothing_strength) / 255.0
             } else {
-                cx.set_gray_fill_color(0.0, 1.0);
+                0.0
+            };
+            cx.set_gray_fill_color(luminance, 1.0);
+            if params.synthetic_bold {
+                cx.set_gray_stroke_color(luminance, 1.0);
             }
             self.fonts[params.font_id.0]
                 .native_font()

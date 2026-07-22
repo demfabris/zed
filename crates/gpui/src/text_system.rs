@@ -514,6 +514,11 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.descent(font_size))
     }
 
+    /// Get the recommended additional space between lines for the given font and size.
+    pub fn line_gap(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.line_gap(font_size))
+    }
+
     /// Get the recommended baseline offset for the given font and line height.
     pub fn baseline_offset(
         &self,
@@ -1254,6 +1259,29 @@ impl TextRun {
 #[repr(C)]
 pub struct GlyphId(pub u32);
 
+/// Controls optional raster effects when painting shaped glyphs.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct GlyphRenderOptions {
+    /// Override the platform's default font smoothing behavior.
+    pub font_smoothing: FontSmoothing,
+    /// Draw a fill and outline when the selected family has no bold face.
+    pub synthetic_bold: bool,
+    /// Slant the glyph when the selected family has no italic face.
+    pub synthetic_italic: bool,
+}
+
+/// A per-paint override for platform font smoothing.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum FontSmoothing {
+    /// Use the platform's normal color-dependent smoothing policy.
+    #[default]
+    PlatformDefault,
+    /// Disable font smoothing for this glyph.
+    Disabled,
+    /// Enable font smoothing with an explicit strength from 0 through 255.
+    Enabled(u8),
+}
+
 /// Parameters for rendering a glyph, used as cache keys for raster bounds.
 ///
 /// This struct identifies a specific glyph rendering configuration including
@@ -1269,7 +1297,10 @@ pub struct RenderGlyphParams {
     pub scale_factor: f32,
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
-    pub dilation: u8,
+    pub font_smoothing: bool,
+    pub font_smoothing_strength: u8,
+    pub synthetic_bold: bool,
+    pub synthetic_italic: bool,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1283,7 +1314,10 @@ impl Hash for RenderGlyphParams {
         self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
-        self.dilation.hash(state);
+        self.font_smoothing.hash(state);
+        self.font_smoothing_strength.hash(state);
+        self.synthetic_bold.hash(state);
+        self.synthetic_italic.hash(state);
     }
 }
 
