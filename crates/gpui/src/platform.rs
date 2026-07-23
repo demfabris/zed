@@ -347,6 +347,13 @@ pub trait PlatformDisplay: Debug {
         self.bounds()
     }
 
+    /// The display's current refresh rate in hertz, if the platform reports it.
+    /// Embedders can use this to derive frame-rate ceilings for content they
+    /// pace themselves (e.g. offscreen-rendered browser views).
+    fn refresh_rate(&self) -> Option<f32> {
+        None
+    }
+
     /// Get the default bounds for this display to place a window
     fn default_bounds(&self) -> Bounds<Pixels> {
         let bounds = self.bounds();
