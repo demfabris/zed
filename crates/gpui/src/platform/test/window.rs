@@ -52,7 +52,9 @@ impl HasWindowHandle for TestWindow {
     fn window_handle(
         &self,
     ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+        // Test windows are not backed by a real platform window; report that
+        // as an error so callers can degrade gracefully instead of panicking.
+        Err(raw_window_handle::HandleError::Unavailable)
     }
 }
 
@@ -60,7 +62,8 @@ impl HasDisplayHandle for TestWindow {
     fn display_handle(
         &self,
     ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        unimplemented!("Test Windows are not backed by a real platform window")
+        // See `window_handle` above.
+        Err(raw_window_handle::HandleError::Unavailable)
     }
 }
 
