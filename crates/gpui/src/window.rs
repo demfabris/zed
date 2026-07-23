@@ -7912,11 +7912,11 @@ mod tests {
             .update(cx, |_, window, _| {
                 assert!(matches!(
                     window.window_handle(),
-                    Err(HandleError::NotSupported)
+                    Err(HandleError::Unavailable)
                 ));
                 assert!(matches!(
                     window.display_handle(),
-                    Err(HandleError::NotSupported)
+                    Err(HandleError::Unavailable)
                 ));
             })
             .unwrap();
