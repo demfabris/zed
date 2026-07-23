@@ -286,6 +286,7 @@ pub struct InProgressOutput {
     position: Option<Point<DevicePixels>>,
     size: Option<Size<DevicePixels>>,
     subpixel: Option<wl_output::Subpixel>,
+    refresh_millihertz: Option<i32>,
 }
 
 impl InProgressOutput {
@@ -297,6 +298,7 @@ impl InProgressOutput {
                 scale,
                 bounds: Bounds::new(position, size),
                 subpixel: self.subpixel,
+                refresh_millihertz: self.refresh_millihertz,
             })
         } else {
             None
@@ -310,6 +312,7 @@ pub struct Output {
     pub scale: i32,
     pub bounds: Bounds<DevicePixels>,
     pub subpixel: Option<wl_output::Subpixel>,
+    pub refresh_millihertz: Option<i32>,
 }
 
 pub(crate) struct WaylandClientState {
@@ -1084,6 +1087,7 @@ impl LinuxClient for WaylandClient {
                     id: id.clone(),
                     name: output.name.clone(),
                     bounds: output.bounds.to_pixels(output.scale as f32),
+                    refresh_millihertz: output.refresh_millihertz,
                 }) as Rc<dyn PlatformDisplay>
             })
             .collect()
@@ -1100,6 +1104,7 @@ impl LinuxClient for WaylandClient {
                         id: object_id.clone(),
                         name: output.name.clone(),
                         bounds: output.bounds.to_pixels(output.scale as f32),
+                        refresh_millihertz: output.refresh_millihertz,
                     }) as Rc<dyn PlatformDisplay>
                 })
             })
@@ -1609,8 +1614,14 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandClientStatePtr {
                     in_progress_output.subpixel = Some(subpixel);
                 }
             }
-            wl_output::Event::Mode { width, height, .. } => {
-                in_progress_output.size = Some(size(DevicePixels(width), DevicePixels(height)))
+            wl_output::Event::Mode {
+                width,
+                height,
+                refresh,
+                ..
+            } => {
+                in_progress_output.size = Some(size(DevicePixels(width), DevicePixels(height)));
+                in_progress_output.refresh_millihertz = (refresh > 0).then_some(refresh);
             }
             wl_output::Event::Done => {
                 if let Some(complete) = in_progress_output.complete() {

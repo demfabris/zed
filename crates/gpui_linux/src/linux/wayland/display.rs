@@ -15,6 +15,8 @@ pub(crate) struct WaylandDisplay {
     pub id: ObjectId,
     pub name: Option<String>,
     pub bounds: Bounds<Pixels>,
+    /// Refresh rate of the output's current mode, from `wl_output::mode`.
+    pub refresh_millihertz: Option<i32>,
 }
 
 impl Hash for WaylandDisplay {
@@ -38,5 +40,10 @@ impl PlatformDisplay for WaylandDisplay {
 
     fn bounds(&self) -> Bounds<Pixels> {
         self.bounds
+    }
+
+    fn refresh_rate(&self) -> Option<f32> {
+        self.refresh_millihertz
+            .map(|millihertz| millihertz as f32 / 1000.0)
     }
 }
