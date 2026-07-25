@@ -956,6 +956,7 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) hitboxes: Vec<Hitbox>,
+    hit_test_limit: Option<usize>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
@@ -1002,6 +1003,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             hitboxes: Vec::new(),
+            hit_test_limit: None,
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
@@ -1030,6 +1032,7 @@ impl Frame {
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
         self.hitboxes.clear();
+        self.hit_test_limit = None;
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
@@ -1065,7 +1068,8 @@ impl Frame {
     pub(crate) fn hit_test(&self, position: Point<Pixels>) -> HitTest {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
-        for hitbox in self.hitboxes.iter().rev() {
+        let hitbox_count = self.hit_test_limit.unwrap_or(self.hitboxes.len());
+        for hitbox in self.hitboxes.iter().take(hitbox_count).rev() {
             let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
             if bounds.contains(&position) {
                 hit_test.ids.push(hitbox.id);
@@ -3065,6 +3069,9 @@ impl Window {
             prompt_element = Some(element);
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
+            // A drag preview is visual only. Keep the root and deferred-draw
+            // hitboxes, but exclude hitboxes registered by the preview itself.
+            self.next_frame.hit_test_limit = Some(self.next_frame.hitboxes.len());
             let mut element = active_drag.view.clone().into_any_element();
             let offset = self.mouse_position() - active_drag.cursor_offset;
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
@@ -6873,10 +6880,10 @@ mod tests {
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        InputEvent as _, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+        MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
+        StatefulInteractiveElement as _, Styled, TestAppContext, VisualTestContext, Window,
+        WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
 
     struct EmptyView;
@@ -7484,5 +7491,88 @@ mod tests {
             })
             .unwrap();
         assert_eq!(b_focus_count.get(), 1);
+    }
+
+    struct DragValue;
+
+    struct OccludingDragPreview;
+
+    impl Render for OccludingDragPreview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(200.)).h(px(100.)).occlude()
+        }
+    }
+
+    struct DragDropView {
+        dropped: Rc<Cell<bool>>,
+    }
+
+    impl Render for DragDropView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let dropped = self.dropped.clone();
+            div()
+                .flex()
+                .w(px(200.))
+                .h(px(100.))
+                .child(
+                    div()
+                        .id("drag-source")
+                        .w(px(100.))
+                        .h(px(100.))
+                        .on_drag(DragValue, |_, _, _, cx| cx.new(|_| OccludingDragPreview)),
+                )
+                .child(
+                    div()
+                        .id("drop-target")
+                        .w(px(100.))
+                        .h(px(100.))
+                        .on_drop::<DragValue>(move |_, _, _| dropped.set(true)),
+                )
+        }
+    }
+
+    #[test]
+    fn active_drag_preview_is_pointer_transparent() {
+        let mut cx = TestAppContext::single();
+        let dropped = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let dropped = dropped.clone();
+            move |_, _| DragDropView { dropped }
+        });
+        let any_window = window.into();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        let mut cx = VisualTestContext::from_window(any_window, &cx);
+        cx.simulate_mouse_move(
+            point(px(10.), px(10.)),
+            None::<MouseButton>,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_down(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(20.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(150.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(px(150.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        assert!(dropped.get());
     }
 }
