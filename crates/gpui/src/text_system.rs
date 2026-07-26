@@ -281,6 +281,15 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.line_gap(font_size))
     }
 
+    /// Get the suggested thickness of the underline for the given font and size.
+    ///
+    /// Terminal emulators size hand-drawn cell geometry — box drawing, underlines,
+    /// strikethrough — from this metric so that synthesized strokes match the weight
+    /// of the face they sit next to.
+    pub fn underline_thickness(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.underline_thickness(font_size))
+    }
+
     /// Get the recommended baseline offset for the given font and line height.
     pub fn baseline_offset(
         &self,
