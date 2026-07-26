@@ -1,11 +1,31 @@
+use crate::util::round_half_toward_zero;
 use crate::{
-    App, Bounds, DevicePixels, GlyphRenderOptions, Half, Hsla, LineLayout, Pixels, Point,
-    RenderGlyphParams, Result, ShapedGlyph, ShapedRun, SharedString, StrikethroughStyle, TextAlign,
-    UnderlineStyle, Window, WrapBoundary, WrappedLineLayout, black, fill, point, px, size,
+    App, AtlasTile, Bounds, GlyphRenderOptions, Half, Hsla, IsZero, LineLayout, Pixels, Point,
+    RenderGlyphParams, Result, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, ShapedGlyph,
+    ShapedRun, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
+    WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// One pre-resolved glyph sprite: everything paint needs except the final origin.
+#[derive(Clone, Debug)]
+pub struct GlyphRasterItem {
+    /// Raster bounds relative to the quantized line origin, in scaled pixels.
+    relative_bounds: Bounds<ScaledPixels>,
+    tile: AtlasTile,
+    /// Resolved decoration-run color without element opacity applied.
+    color: Hsla,
+    kind: GlyphSpriteKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GlyphSpriteKind {
+    Monochrome,
+    Subpixel,
+    Polychrome,
+}
 
 /// Pre-computed glyph data for efficient painting without per-glyph cache lookups.
 ///
@@ -13,10 +33,12 @@ use std::sync::Arc;
 /// and consumed by `ShapedLine::paint_with_raster_data` during paint.
 #[derive(Clone, Debug)]
 pub struct GlyphRasterData {
-    /// The raster bounds for each glyph, in paint order.
-    pub bounds: Vec<Bounds<DevicePixels>>,
-    /// The render params for each glyph (needed for sprite atlas lookup).
-    pub params: Vec<RenderGlyphParams>,
+    items: Vec<GlyphRasterItem>,
+    /// Subpixel phase of the quantized line origin used to compute the items.
+    origin_phase: Point<u8>,
+    scale_factor: f32,
+    /// Fingerprint of window-level text raster state.
+    window_state: u64,
 }
 
 /// Set the text decoration for a run of text.
@@ -125,6 +147,222 @@ impl ShapedLine {
         )?;
 
         Ok(())
+    }
+
+    /// Pre-resolves this line's glyph sprites during prepaint for use during paint.
+    ///
+    /// Returns `Ok(None)` for decorated lines whose underline or strikethrough state
+    /// requires the caller to fall back to [`Self::paint_with_options`].
+    pub fn compute_glyph_raster_data(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        options: GlyphRenderOptions,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Result<Option<GlyphRasterData>> {
+        if self
+            .decoration_runs
+            .iter()
+            .any(|run| run.underline.is_some() || run.strikethrough.is_some())
+        {
+            return Ok(None);
+        }
+
+        let scale_factor = window.scale_factor();
+        let window_state = window.text_raster_state_key();
+        let (quantized_line_origin, origin_phase) = quantized_subpixel_origin(origin, scale_factor);
+        let padding_top = (line_height - self.layout.ascent - self.layout.descent) / 2.;
+        let baseline_offset = point(px(0.), padding_top + self.layout.ascent);
+        let text_system = cx.text_system().clone();
+        let mut decoration_runs = self.decoration_runs.iter();
+        let mut run_end = 0;
+        let mut color = black();
+        let mut glyph_origin = origin;
+        let mut previous_glyph_position = Point::default();
+        let mut items =
+            Vec::with_capacity(self.layout.runs.iter().map(|run| run.glyphs.len()).sum());
+
+        for run in &self.layout.runs {
+            for glyph in &run.glyphs {
+                glyph_origin.x += glyph.position.x - previous_glyph_position.x;
+                previous_glyph_position = glyph.position;
+
+                if glyph.index >= run_end {
+                    let mut style_run = decoration_runs.next();
+
+                    while let Some(run) = style_run {
+                        if glyph.index < run_end + run.len as usize {
+                            break;
+                        }
+                        run_end += run.len as usize;
+                        style_run = decoration_runs.next();
+                    }
+
+                    if let Some(style_run) = style_run {
+                        run_end += style_run.len as usize;
+                        color = style_run.color;
+                    } else {
+                        run_end = self.layout.len;
+                    }
+                }
+
+                let raster_origin =
+                    glyph_origin + baseline_offset + point(px(0.), glyph.position.y);
+                let (bounds, tile, kind) = if glyph.is_emoji {
+                    let integer_origin = raster_origin
+                        .scale(scale_factor)
+                        .map(|coordinate| ScaledPixels(round_half_toward_zero(coordinate.0)));
+                    let params = RenderGlyphParams {
+                        font_id: run.font_id,
+                        glyph_id: glyph.id,
+                        font_size: self.layout.font_size,
+                        subpixel_variant: Default::default(),
+                        scale_factor,
+                        is_emoji: true,
+                        subpixel_rendering: false,
+                        font_smoothing: false,
+                        font_smoothing_strength: 0,
+                        synthetic_bold: false,
+                        synthetic_italic: false,
+                    };
+                    let raster_bounds = text_system.raster_bounds(&params)?;
+                    if raster_bounds.is_zero() {
+                        continue;
+                    }
+                    let tile = window.get_or_insert_glyph_tile(&params)?;
+                    (
+                        Bounds {
+                            origin: integer_origin + raster_bounds.origin.map(Into::into),
+                            size: tile.bounds.size.map(Into::into),
+                        },
+                        tile,
+                        GlyphSpriteKind::Polychrome,
+                    )
+                } else {
+                    let (quantized_origin, subpixel_variant) =
+                        quantized_subpixel_origin(raster_origin, scale_factor);
+                    let integer_origin =
+                        quantized_origin.map(|coordinate| ScaledPixels(coordinate.0.trunc()));
+                    let subpixel_rendering =
+                        window.should_use_subpixel_rendering(run.font_id, self.layout.font_size);
+                    let (font_smoothing, font_smoothing_strength) = match options.font_smoothing {
+                        crate::FontSmoothing::PlatformDefault => {
+                            let level = text_system.glyph_dilation_for_color(color);
+                            let strength = match level {
+                                0 => 0,
+                                1 => 64,
+                                2 => 128,
+                                3 => 191,
+                                _ => 255,
+                            };
+                            (level > 0, strength)
+                        }
+                        crate::FontSmoothing::Disabled => (false, 0),
+                        crate::FontSmoothing::Enabled(strength) => (true, strength),
+                    };
+                    let params = RenderGlyphParams {
+                        font_id: run.font_id,
+                        glyph_id: glyph.id,
+                        font_size: self.layout.font_size,
+                        subpixel_variant,
+                        scale_factor,
+                        is_emoji: false,
+                        subpixel_rendering,
+                        font_smoothing,
+                        font_smoothing_strength,
+                        synthetic_bold: options.synthetic_bold,
+                        synthetic_italic: options.synthetic_italic,
+                    };
+                    let raster_bounds = text_system.raster_bounds(&params)?;
+                    if raster_bounds.is_zero() {
+                        continue;
+                    }
+                    let tile = window.get_or_insert_glyph_tile(&params)?;
+                    (
+                        Bounds {
+                            origin: integer_origin + raster_bounds.origin.map(Into::into),
+                            size: tile.bounds.size.map(Into::into),
+                        },
+                        tile,
+                        if subpixel_rendering {
+                            GlyphSpriteKind::Subpixel
+                        } else {
+                            GlyphSpriteKind::Monochrome
+                        },
+                    )
+                };
+
+                items.push(GlyphRasterItem {
+                    relative_bounds: bounds - quantized_line_origin,
+                    tile,
+                    color,
+                    kind,
+                });
+            }
+        }
+
+        Ok(Some(GlyphRasterData {
+            items,
+            origin_phase,
+            scale_factor,
+            window_state,
+        }))
+    }
+
+    /// Paints glyph sprites pre-resolved by [`Self::compute_glyph_raster_data`].
+    ///
+    /// Returns `false` when the cached raster state is invalid, in which case the
+    /// caller must fall back to [`Self::paint_with_options`] and recompute it.
+    #[must_use]
+    pub fn paint_with_raster_data(
+        &self,
+        data: &GlyphRasterData,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        window: &mut Window,
+    ) -> bool {
+        let scale_factor = window.scale_factor();
+        let window_state = window.text_raster_state_key();
+        if !glyph_raster_data_is_valid(data, origin, scale_factor, window_state) {
+            return false;
+        }
+
+        let (quantized_line_origin, _) = quantized_subpixel_origin(origin, scale_factor);
+        let content_mask = window.snapped_content_mask();
+        let opacity = window.element_opacity();
+        let line_bounds = Bounds::new(origin, size(self.layout.width, line_height));
+        window.paint_layer(line_bounds, |window| {
+            for item in &data.items {
+                let bounds = item.relative_bounds + quantized_line_origin;
+                if !bounds.intersects(&content_mask.bounds) {
+                    continue;
+                }
+
+                match item.kind {
+                    GlyphSpriteKind::Monochrome => window.paint_cached_monochrome_glyph(
+                        bounds,
+                        content_mask,
+                        item.color.opacity(opacity),
+                        item.tile,
+                    ),
+                    GlyphSpriteKind::Subpixel => window.paint_cached_subpixel_glyph(
+                        bounds,
+                        content_mask,
+                        item.color.opacity(opacity),
+                        item.tile,
+                    ),
+                    GlyphSpriteKind::Polychrome => window.paint_cached_polychrome_glyph(
+                        bounds,
+                        content_mask,
+                        opacity,
+                        item.tile,
+                    ),
+                }
+            }
+        });
+
+        true
     }
 
     /// Paint the background of the line to the window.
@@ -273,6 +511,39 @@ impl ShapedLine {
 
         (left, right)
     }
+}
+
+fn quantized_subpixel_origin(
+    origin: Point<Pixels>,
+    scale_factor: f32,
+) -> (Point<ScaledPixels>, Point<u8>) {
+    let scaled_origin = origin.scale(scale_factor);
+    let quantized_origin = Point::new(
+        ScaledPixels(
+            round_half_toward_zero(scaled_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+        ),
+        ScaledPixels(
+            round_half_toward_zero(scaled_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        ),
+    );
+    let origin_phase = Point::new(
+        (quantized_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+        (quantized_origin.y.0.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+    );
+    (quantized_origin, origin_phase)
+}
+
+fn glyph_raster_data_is_valid(
+    data: &GlyphRasterData,
+    origin: Point<Pixels>,
+    scale_factor: f32,
+    window_state: u64,
+) -> bool {
+    data.scale_factor == scale_factor
+        && data.origin_phase == quantized_subpixel_origin(origin, scale_factor).1
+        && data.window_state == window_state
 }
 
 /// A line of text that has been shaped, decorated, and wrapped by the text layout system.
@@ -1037,5 +1308,60 @@ mod tests {
         assert_eq!(right.decoration_runs[0].color, green);
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
+    }
+
+    #[test]
+    fn glyph_raster_data_validity_tracks_origin_phase_scale_and_window_state() {
+        let origin = point(px(0.125), px(0.0));
+        let scale_factor = 2.0;
+        let window_state = 17;
+        let (quantized_origin, origin_phase) = quantized_subpixel_origin(origin, scale_factor);
+        let data = GlyphRasterData {
+            items: Vec::new(),
+            origin_phase,
+            scale_factor,
+            window_state,
+        };
+
+        assert!(glyph_raster_data_is_valid(
+            &data,
+            origin,
+            scale_factor,
+            window_state
+        ));
+
+        let translated_origin = point(origin.x + px(1.0), origin.y);
+        let (quantized_translated_origin, translated_phase) =
+            quantized_subpixel_origin(translated_origin, scale_factor);
+        assert_eq!(translated_phase, origin_phase);
+        assert_eq!(
+            quantized_translated_origin.x - quantized_origin.x,
+            ScaledPixels(2.0)
+        );
+        assert!(glyph_raster_data_is_valid(
+            &data,
+            translated_origin,
+            scale_factor,
+            window_state
+        ));
+
+        assert!(!glyph_raster_data_is_valid(
+            &data,
+            point(px(0.25), px(0.0)),
+            scale_factor,
+            window_state
+        ));
+        assert!(!glyph_raster_data_is_valid(
+            &data,
+            origin,
+            1.0,
+            window_state
+        ));
+        assert!(!glyph_raster_data_is_valid(
+            &data,
+            origin,
+            scale_factor,
+            window_state + 1
+        ));
     }
 }

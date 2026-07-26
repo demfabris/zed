@@ -47,6 +47,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
+    collections::hash_map::DefaultHasher,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -2741,7 +2742,7 @@ impl Window {
     }
 
     #[inline]
-    fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+    pub(crate) fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(self.content_mask().bounds),
         }
@@ -4305,7 +4306,81 @@ impl Window {
         Ok(())
     }
 
-    fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+    pub(crate) fn get_or_insert_glyph_tile(&self, params: &RenderGlyphParams) -> Result<AtlasTile> {
+        self.sprite_atlas
+            .get_or_insert_with(&params.clone().into(), &mut || {
+                let (size, bytes) = self.text_system().rasterize_glyph(params)?;
+                Ok(Some((size, Cow::Owned(bytes))))
+            })
+            .and_then(|tile| tile.ok_or_else(|| anyhow!("glyph rasterization returned no tile")))
+    }
+
+    pub(crate) fn paint_cached_monochrome_glyph(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        color: Hsla,
+        tile: AtlasTile,
+    ) {
+        self.next_frame.scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask,
+            color,
+            tile,
+            transformation: TransformationMatrix::unit(),
+        });
+    }
+
+    pub(crate) fn paint_cached_subpixel_glyph(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        color: Hsla,
+        tile: AtlasTile,
+    ) {
+        self.next_frame.scene.insert_primitive(SubpixelSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask,
+            color,
+            tile,
+            transformation: TransformationMatrix::unit(),
+        });
+    }
+
+    pub(crate) fn paint_cached_polychrome_glyph(
+        &mut self,
+        bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        opacity: f32,
+        tile: AtlasTile,
+    ) {
+        self.next_frame.scene.insert_primitive(PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false.into(),
+            opacity,
+            bounds,
+            content_mask,
+            corner_radii: Default::default(),
+            tile,
+        });
+    }
+
+    pub(crate) fn text_raster_state_key(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        mem::discriminant(&self.platform_window.background_appearance()).hash(&mut hasher);
+        self.platform_window
+            .is_subpixel_rendering_supported()
+            .hash(&mut hasher);
+        mem::discriminant(&self.text_rendering_mode.get()).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub(crate) fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
