@@ -171,31 +171,38 @@ impl Pasteboard {
                 }
                 [ClipboardEntry::ExternalPaths(_)] => {}
                 _ => {
-                    // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
-                    //
-                    // This was the existing behavior before I refactored the outer clipboard code:
-                    // https://github.com/zed-industries/zed/blob/65f7412a0265552b06ce122655369d6cc7381dd6/crates/gpui/src/platform/mac/platform.rs#L1060-L1110
-                    //
-                    // Note how `any_images` is always `false`. We should fix that, but that's orthogonal to the refactor.
+                    // Every entry lands on the same pasteboard item, as a separate
+                    // flavor, so a paste target that wants text gets the text and one
+                    // that wants an image gets the image.
+                    let mut combined: Option<ClipboardString> = None;
 
-                    let mut combined = ClipboardString {
-                        text: String::new(),
-                        metadata: None,
-                    };
+                    for entry in item.entries.iter() {
+                        if let ClipboardEntry::String(string) = entry {
+                            let combined = combined.get_or_insert_with(|| ClipboardString {
+                                text: String::new(),
+                                metadata: None,
+                            });
 
-                    for entry in item.entries {
-                        match entry {
-                            ClipboardEntry::String(text) => {
-                                combined.text.push_str(&text.text());
-                                if combined.metadata.is_none() {
-                                    combined.metadata = text.metadata;
-                                }
+                            combined.text.push_str(string.text());
+                            if combined.metadata.is_none() {
+                                combined.metadata = string.metadata.clone();
                             }
-                            _ => {}
                         }
                     }
 
-                    self.write_plaintext(&combined);
+                    self.inner.clearContents();
+
+                    if let Some(combined) = combined.as_ref() {
+                        self.set_plaintext_data(combined);
+                    }
+
+                    // A pasteboard item holds at most one representation per UTI, so
+                    // images that share a format collapse onto the last one written.
+                    for entry in item.entries.iter() {
+                        if let ClipboardEntry::Image(image) = entry {
+                            self.set_image_data(image);
+                        }
+                    }
                 }
             }
         }
@@ -204,7 +211,13 @@ impl Pasteboard {
     fn write_plaintext(&self, string: &ClipboardString) {
         unsafe {
             self.inner.clearContents();
+            self.set_plaintext_data(string);
+        }
+    }
 
+    /// Adds the text flavors to the pasteboard's current item, without clearing it first.
+    unsafe fn set_plaintext_data(&self, string: &ClipboardString) {
+        unsafe {
             let text_bytes = NSData::dataWithBytes_length_(
                 nil,
                 string.text.as_ptr() as *const c_void,
@@ -236,7 +249,13 @@ impl Pasteboard {
     unsafe fn write_image(&self, image: &Image) {
         unsafe {
             self.inner.clearContents();
+            self.set_image_data(image);
+        }
+    }
 
+    /// Adds the image flavor to the pasteboard's current item, without clearing it first.
+    unsafe fn set_image_data(&self, image: &Image) {
+        unsafe {
             let bytes = NSData::dataWithBytes_length_(
                 nil,
                 image.bytes.as_ptr() as *const c_void,
@@ -338,10 +357,19 @@ mod tests {
     };
     use std::ffi::c_void;
 
-    use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, ImageFormat};
+    use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, Image, ImageFormat, hash};
     use objc::rc::autoreleasepool;
 
     use super::*;
+
+    /// Smallest valid PNG: 1x1 transparent pixel
+    const PNG_BYTES: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+        0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
 
     unsafe fn simulate_external_file_copy(pasteboard: &Pasteboard, paths: &[&str]) {
         unsafe {
@@ -501,14 +529,7 @@ mod tests {
     fn test_read_image() {
         let pasteboard = Pasteboard::unique();
 
-        // Smallest valid PNG: 1x1 transparent pixel
-        let png_bytes: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC, 0x00, 0x00,
-            0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
+        let png_bytes = PNG_BYTES;
 
         unsafe {
             let ns_png_type = NSPasteboardTypePNG;
@@ -533,6 +554,44 @@ mod tests {
                 assert_eq!(img.bytes, png_bytes);
             }
             other => panic!("expected Image, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_write_string_and_image() {
+        let pasteboard = Pasteboard::unique();
+        let bytes = PNG_BYTES.to_vec();
+
+        pasteboard.write(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::String(ClipboardString::new("hello ".to_string())),
+                ClipboardEntry::Image(Image {
+                    format: ImageFormat::Png,
+                    id: hash(&bytes),
+                    bytes,
+                }),
+                ClipboardEntry::String(
+                    ClipboardString::new("world".to_string()).with_json_metadata(vec![3, 4]),
+                ),
+            ],
+        });
+
+        // A target that wants text sees the concatenated strings...
+        assert_eq!(
+            pasteboard.read(),
+            Some(ClipboardItem {
+                entries: vec![ClipboardEntry::String(
+                    ClipboardString::new("hello world".to_string()).with_json_metadata(vec![3, 4])
+                )],
+            })
+        );
+
+        // ...and a target that wants an image finds it on that same item.
+        unsafe {
+            assert_eq!(
+                pasteboard.data_for_type(UTType::png().inner_mut()),
+                Some(PNG_BYTES)
+            );
         }
     }
 }
