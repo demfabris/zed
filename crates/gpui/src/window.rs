@@ -7575,4 +7575,86 @@ mod tests {
 
         assert!(dropped.get());
     }
+
+    struct RejectingDropView {
+        dropped: Rc<Cell<bool>>,
+    }
+
+    impl Render for RejectingDropView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let dropped = self.dropped.clone();
+            // The outer element accepts the drop; the inner element under the
+            // release point rejects it via can_drop. The rejection must leave
+            // the drag intact so the outer target still receives it.
+            div()
+                .id("accepting-outer")
+                .flex()
+                .w(px(200.))
+                .h(px(100.))
+                .on_drop::<DragValue>(move |_, _, _| dropped.set(true))
+                .child(
+                    div()
+                        .id("drag-source")
+                        .w(px(100.))
+                        .h(px(100.))
+                        .on_drag(DragValue, |_, _, _, cx| cx.new(|_| OccludingDragPreview)),
+                )
+                .child(
+                    div()
+                        .id("rejecting-inner")
+                        .w(px(100.))
+                        .h(px(100.))
+                        .can_drop(|_, _, _| false)
+                        .on_drop::<DragValue>(|_, _, _| unreachable!("can_drop rejected")),
+                )
+        }
+    }
+
+    #[test]
+    fn rejected_can_drop_does_not_consume_the_drag() {
+        let mut cx = TestAppContext::single();
+        let dropped = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let dropped = dropped.clone();
+            move |_, _| RejectingDropView { dropped }
+        });
+        let any_window = window.into();
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .unwrap();
+
+        let mut cx = VisualTestContext::from_window(any_window, &cx);
+        cx.simulate_mouse_move(
+            point(px(10.), px(10.)),
+            None::<MouseButton>,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_down(
+            point(px(10.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(20.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(150.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(px(150.), px(10.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        assert!(
+            dropped.get(),
+            "a rejected can_drop consumed the drag instead of passing it through"
+        );
+    }
 }

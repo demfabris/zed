@@ -2796,6 +2796,13 @@ impl Interactivity {
                                     listener(drag.value.as_ref(), window, cx);
                                     window.refresh();
                                     cx.stop_propagation();
+                                } else {
+                                    // A rejected drop must not consume the drag:
+                                    // restore it so it can propagate to targets
+                                    // beneath, and so the release is handled by
+                                    // the standard cancel path (which schedules
+                                    // the redraw) instead of vanishing silently.
+                                    cx.active_drag = Some(drag);
                                 }
                             }
                         }
