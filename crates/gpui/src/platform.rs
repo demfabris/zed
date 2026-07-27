@@ -1987,6 +1987,7 @@ impl Default for WindowOptions {
                 title: Default::default(),
                 appears_transparent: Default::default(),
                 traffic_light_position: Default::default(),
+                traffic_light_scale: Default::default(),
             }),
             focus: true,
             show: true,
@@ -2018,6 +2019,11 @@ pub struct TitlebarOptions {
 
     /// The position of the macOS traffic light buttons
     pub traffic_light_position: Option<Point<Pixels>>,
+
+    /// Scale applied to the macOS traffic light buttons when a custom
+    /// `traffic_light_position` is set. `None` keeps the native size; macOS 26
+    /// draws 14pt buttons, so `12.0 / 14.0` reproduces the compact pre-26 look.
+    pub traffic_light_scale: Option<f32>,
 }
 
 /// The kind of window to create

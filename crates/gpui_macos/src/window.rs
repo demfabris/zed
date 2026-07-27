@@ -54,7 +54,7 @@ use objc2_app_kit::{
     NSBeep, NSButton as Objc2NSButton, NSView as Objc2NSView, NSWindow as Objc2NSWindow,
     NSWindowButton as Objc2NSWindowButton,
 };
-use objc2_foundation::{NSPoint as Objc2NSPoint, NSRect as Objc2NSRect};
+use objc2_foundation::{NSPoint as Objc2NSPoint, NSRect as Objc2NSRect, NSSize as Objc2NSSize};
 use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
@@ -522,6 +522,7 @@ struct MacWindowState {
     last_left_mouse_down_event: Option<Retained<Objc2Object>>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
+    traffic_light_scale: f32,
     traffic_light_frames: Option<TrafficLightFrames>,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
@@ -561,7 +562,8 @@ impl MacWindowState {
             }
 
             let window_height = Pixels::from(self.native_window().frame().size.height);
-            if self.traffic_light_frames.is_some() {
+            if let Some(frames) = self.traffic_light_frames.as_ref() {
+                let (native_close, native_minimize) = (frames.close, frames.minimize);
                 // AppKit can recreate standard buttons, so fetch the live views for each layout pass.
                 let Some(buttons) = self.traffic_light_buttons() else {
                     return;
@@ -570,36 +572,78 @@ impl MacWindowState {
                     return;
                 };
 
-                let close_frame = buttons.close.frame();
-                let minimize_frame = buttons.minimize.frame();
-                let button_width = Pixels::from(close_frame.size.width);
-                let button_height = Pixels::from(close_frame.size.height);
-                let button_padding = Pixels::from(
-                    minimize_frame.origin.x - close_frame.origin.x - close_frame.size.width,
-                );
-                let container_height =
-                    button_height + traffic_light_position.y + traffic_light_position.y;
+                // Compact metrics derive from the frames captured before any
+                // adjustment, so repeated layout passes cannot compound the
+                // scale. The frames themselves stay at native size: Auto
+                // Layout pins the standard buttons' size and silently reverts
+                // a shrunken frame on the next on-screen layout pass. The
+                // visual shrink rides each button's layer transform instead,
+                // which layout and appearance redraws leave alone, and the
+                // frame origins place the scaled glyphs on the compact grid.
+                let scale = f64::from(self.traffic_light_scale);
+                let native_width = native_close.size.width;
+                let native_height = native_close.size.height;
+                let native_padding =
+                    native_minimize.origin.x - native_close.origin.x - native_width;
+                let glyph_width = native_width * scale;
+                let glyph_height = native_height * scale;
+                let center_spacing = (native_width + native_padding) * scale;
+                let container_height = Pixels::from(glyph_height)
+                    + traffic_light_position.y
+                    + traffic_light_position.y;
 
                 let mut titlebar_frame = titlebar_container.frame();
                 titlebar_frame.size.height = container_height.to_f64();
                 titlebar_frame.origin.y = (window_height - container_height).to_f64();
 
-                let minimize_x = traffic_light_position.x + button_width + button_padding;
-                let zoom_x = minimize_x + button_width + button_padding;
+                let button_views = [&buttons.close, &buttons.minimize, &buttons.zoom];
 
+                // Where the scaled glyph's center lands inside the native
+                // frame depends on the layer's anchor point, so read it while
+                // applying the scale.
+                let mut center_offset_x = native_width / 2.0 * scale;
+                let mut center_offset_y = native_height / 2.0 * scale;
+                if (scale - 1.0).abs() > f64::EPSILON {
+                    unsafe {
+                        let () = msg_send![class!(CATransaction), begin];
+                        let () = msg_send![class!(CATransaction), setDisableActions: YES];
+                        for (index, button) in button_views.iter().enumerate() {
+                            let button_id =
+                                Retained::as_ptr(*button).cast::<Object>().cast_mut();
+                            let layer: id = msg_send![button_id, layer];
+                            if layer.is_null() {
+                                continue;
+                            }
+                            if index == 0 {
+                                let anchor: NSPoint = msg_send![layer, anchorPoint];
+                                let anchor_x = anchor.x * native_width;
+                                let anchor_y = anchor.y * native_height;
+                                center_offset_x =
+                                    anchor_x + (native_width / 2.0 - anchor_x) * scale;
+                                center_offset_y =
+                                    anchor_y + (native_height / 2.0 - anchor_y) * scale;
+                            }
+                            let amount: id = msg_send![class!(NSNumber), numberWithDouble: scale];
+                            let () = msg_send![
+                                layer,
+                                setValue: amount
+                                forKeyPath: ns_string("transform.scale")
+                            ];
+                        }
+                        let () = msg_send![class!(CATransaction), commit];
+                    }
+                }
+
+                let first_center_x = traffic_light_position.x.to_f64() + glyph_width / 2.0;
+                let origin_y =
+                    traffic_light_position.y.to_f64() + glyph_height / 2.0 - center_offset_y;
+                let native_size = Objc2NSSize::new(native_width, native_height);
                 titlebar_container.setFrame(titlebar_frame);
-                buttons.close.setFrameOrigin(Objc2NSPoint::new(
-                    traffic_light_position.x.to_f64(),
-                    traffic_light_position.y.to_f64(),
-                ));
-                buttons.minimize.setFrameOrigin(Objc2NSPoint::new(
-                    minimize_x.to_f64(),
-                    traffic_light_position.y.to_f64(),
-                ));
-                buttons.zoom.setFrameOrigin(Objc2NSPoint::new(
-                    zoom_x.to_f64(),
-                    traffic_light_position.y.to_f64(),
-                ));
+                for (index, button) in button_views.iter().enumerate() {
+                    let center_x = first_center_x + center_spacing * index as f64;
+                    button.setFrameSize(native_size);
+                    button.setFrameOrigin(Objc2NSPoint::new(center_x - center_offset_x, origin_y));
+                }
 
                 titlebar_container.updateTrackingAreas();
                 buttons.close.updateTrackingAreas();
@@ -659,6 +703,27 @@ impl MacWindowState {
             buttons.minimize.setFrame(frames.minimize);
             buttons.zoom.setFrame(frames.zoom);
             titlebar_container.setFrame(frames.titlebar);
+
+            if (f64::from(self.traffic_light_scale) - 1.0).abs() > f64::EPSILON {
+                unsafe {
+                    let () = msg_send![class!(CATransaction), begin];
+                    let () = msg_send![class!(CATransaction), setDisableActions: YES];
+                    for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
+                        let button_id = Retained::as_ptr(button).cast::<Object>().cast_mut();
+                        let layer: id = msg_send![button_id, layer];
+                        if layer.is_null() {
+                            continue;
+                        }
+                        let amount: id = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
+                        let () = msg_send![
+                            layer,
+                            setValue: amount
+                            forKeyPath: ns_string("transform.scale")
+                        ];
+                    }
+                    let () = msg_send![class!(CATransaction), commit];
+                }
+            }
 
             titlebar_container.updateTrackingAreas();
             buttons.close.updateTrackingAreas();
@@ -926,6 +991,10 @@ impl MacWindow {
                 traffic_light_position: titlebar
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
+                traffic_light_scale: titlebar
+                    .as_ref()
+                    .and_then(|titlebar| titlebar.traffic_light_scale)
+                    .unwrap_or(1.0),
                 traffic_light_frames: None,
                 transparent_titlebar: titlebar
                     .as_ref()
