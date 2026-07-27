@@ -73,11 +73,17 @@ impl Pasteboard {
                 }
             }
 
-            // Next, check for a plain string.
+            // Next, check for a plain string, keeping the image flavor a mixed
+            // write put alongside it so paste targets can consume both.
             if let Some(string_entry) = self.read_string_from_pasteboard() {
-                return Some(ClipboardItem {
-                    entries: vec![string_entry],
-                });
+                let mut entries = vec![string_entry];
+                for format in ImageFormat::iter() {
+                    if let Some(mut item) = self.read_image(format) {
+                        entries.append(&mut item.entries);
+                        break;
+                    }
+                }
+                return Some(ClipboardItem { entries });
             }
 
             // Finally, try the various supported image types.
@@ -576,22 +582,24 @@ mod tests {
             ],
         });
 
-        // A target that wants text sees the concatenated strings...
+        // The round trip preserves both flavors: the concatenated strings and
+        // the image come back on the same item.
+        let png_bytes = PNG_BYTES.to_vec();
         assert_eq!(
             pasteboard.read(),
             Some(ClipboardItem {
-                entries: vec![ClipboardEntry::String(
-                    ClipboardString::new("hello world".to_string()).with_json_metadata(vec![3, 4])
-                )],
+                entries: vec![
+                    ClipboardEntry::String(
+                        ClipboardString::new("hello world".to_string())
+                            .with_json_metadata(vec![3, 4])
+                    ),
+                    ClipboardEntry::Image(Image {
+                        format: ImageFormat::Png,
+                        id: hash(&png_bytes),
+                        bytes: png_bytes,
+                    }),
+                ],
             })
         );
-
-        // ...and a target that wants an image finds it on that same item.
-        unsafe {
-            assert_eq!(
-                pasteboard.data_for_type(UTType::png().inner_mut()),
-                Some(PNG_BYTES)
-            );
-        }
     }
 }
