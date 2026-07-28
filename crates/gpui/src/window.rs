@@ -3925,12 +3925,24 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            // CSS box-shadow semantics: the spread dilates the shadow's corner
+            // radii along with its bounds (clamped at zero, mirroring the
+            // inset branch), keeping the shadow concentric with the element.
+            // With the element's own radii, a positive-spread shadow bulges at
+            // rounded corners instead of tracing them.
+            let zero = Pixels::ZERO;
+            let shadow_corner_radii = Corners {
+                top_left: (corner_radii.top_left + shadow.spread_radius).max(zero),
+                top_right: (corner_radii.top_right + shadow.spread_radius).max(zero),
+                bottom_right: (corner_radii.bottom_right + shadow.spread_radius).max(zero),
+                bottom_left: (corner_radii.bottom_left + shadow.spread_radius).max(zero),
+            };
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: shadow_corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
