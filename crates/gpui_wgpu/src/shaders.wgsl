@@ -570,6 +570,7 @@ struct Quad {
     corner_radii: Corners,
     border_widths: Edges,
     corner_smoothing: f32,
+    pad: u32, // align to 8 bytes
 }
 
 struct QuadVarying {

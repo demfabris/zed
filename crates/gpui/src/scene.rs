@@ -558,7 +558,17 @@ pub struct Quad {
     /// Superellipse exponent for the rounded corners: `2.0` is a circular
     /// arc, `4.0` is a squircle (continuous corner).
     pub corner_smoothing: f32,
+    /// Padding for alignment for repr(C) layout.
+    pub(crate) pad: u32,
 }
+
+// Shader-side `Bounds` is built from `vec2<f32>`, so every backend aligns
+// `Quad` to 8 and rounds its size up to match. Rust's `repr(C)` alignment is
+// only 4, so a field that leaves the size off an 8-byte boundary shrinks the
+// instance stride below what the shader reads and every draw fails with a
+// binding-size mismatch.
+const _: () = assert!(size_of::<Quad>() % 8 == 0);
+const _: () = assert!(size_of::<Shadow>() % 8 == 0);
 
 impl From<Quad> for Primitive {
     fn from(quad: Quad) -> Self {
