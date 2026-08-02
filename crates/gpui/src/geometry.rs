@@ -2454,16 +2454,6 @@ impl Corners<Pixels> {
 }
 
 impl<T: Div<f32, Output = T> + Ord + Clone + Debug + Default + PartialEq> Corners<T> {
-    /// Clamps corner radii to be less than or equal to half the shortest side of a quad.
-    ///
-    /// # Arguments
-    ///
-    /// * `size` - The size of the quad which limits the size of the corner radii.
-    ///
-    /// # Returns
-    ///
-    /// Anchor radii values clamped to fit.
-    #[must_use]
     /// Resolve these radii against the element they round, so that an ordinary
     /// radius can never turn the element into a pill or a circle.
     ///
@@ -2486,6 +2476,7 @@ impl<T: Div<f32, Output = T> + Ord + Clone + Debug + Default + PartialEq> Corner
     /// circle (`rounded_full` and friends) and still resolves to exactly half,
     /// at every setting including zero. Pill is a category a widget declares,
     /// never somewhere an ordinary radius arrives.
+    #[must_use]
     pub fn resolve_radii_for_quad_size(self, size: Size<Pixels>, fraction: f32) -> Corners<Pixels>
     where
         T: Into<Pixels>,
@@ -2512,6 +2503,16 @@ impl<T: Div<f32, Output = T> + Ord + Clone + Debug + Default + PartialEq> Corner
         }
     }
 
+    /// Clamps corner radii to be less than or equal to half the shortest side of a quad.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - The size of the quad which limits the size of the corner radii.
+    ///
+    /// # Returns
+    ///
+    /// Anchor radii values clamped to fit.
+    #[must_use]
     pub fn clamp_radii_for_quad_size(self, size: Size<T>) -> Corners<T> {
         let max = cmp::min(size.width, size.height) / 2.;
         Corners {

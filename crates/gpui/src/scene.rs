@@ -46,6 +46,10 @@ pub struct WindowCornerMask {
     pub bounds: Bounds<ScaledPixels>,
     /// The corner radii of the clip rectangle, in scaled pixels.
     pub corner_radii: Corners<ScaledPixels>,
+    /// Superellipse exponent for the clip's corners, matching what the frame
+    /// it traces is drawn with. A mask left circular around a squircle frame
+    /// cuts the frame's own border off wherever the two curves part.
+    pub corner_smoothing: f32,
 }
 
 #[derive(Default)]
