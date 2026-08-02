@@ -364,13 +364,23 @@ fn pick_corner_radius(center_to_point: vec2<f32>, radii: Corners) -> f32 {
 // See comments on similar code using `quad_sdf_impl` in `fs_quad` for
 // explanation.
 fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
+    return quad_sdf_smooth(point, bounds, corner_radii, 2.0);
+}
+
+// Distance to a rounded rect whose corners may be superelliptical. A fully
+// rounded rect is a circle or a pill, which keeps true arcs (see `fs_quad`).
+fn quad_sdf_smooth(point: vec2<f32>, bounds: Bounds, corner_radii: Corners, corner_smoothing: f32) -> f32 {
     let half_size = bounds.size / 2.0;
     let center = bounds.origin + half_size;
     let center_to_point = point - center;
     let corner_radius = pick_corner_radius(center_to_point, corner_radii);
     let corner_to_point = abs(center_to_point) - half_size;
     let corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius, 2.0);
+    var smoothing = corner_smoothing;
+    if (corner_radius >= min(half_size.x, half_size.y) - 0.01) {
+        smoothing = 2.0;
+    }
+    return quad_sdf_impl(corner_center_to_point, corner_radius, smoothing);
 }
 
 // `corner_smoothing` is a superellipse exponent: 2 is a circular corner arc,
@@ -634,6 +644,16 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // Radius of the nearest corner
     let corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
 
+    // A fully rounded quad is a circle or a pill rather than a rounded
+    // rectangle, and those read as shapes in their own right: smoothing one
+    // into a superellipse turns a switch thumb into a lozenge. Radii are
+    // clamped to half the shorter side before reaching the GPU, so testing for
+    // equality there selects exactly the fully rounded quads.
+    var corner_smoothing = quad.corner_smoothing;
+    if (corner_radius >= min(half_size.x, half_size.y) - 0.01) {
+        corner_smoothing = 2.0;
+    }
+
     // Width of the nearest borders
     let border = vec2<f32>(
         select(
@@ -690,7 +710,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
-    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, quad.corner_smoothing);
+    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, corner_smoothing);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -997,7 +1017,8 @@ struct Shadow {
     element_corner_radii: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
-    pad: u32, // align to 8 bytes
+    // Superellipse exponent for the corners; only honored when unblurred.
+    corner_smoothing: f32,
 }
 
 struct ShadowVarying {
@@ -1048,7 +1069,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        let distance = quad_sdf_smooth(input.position.xy, shadow.bounds,
+            shadow.corner_radii, shadow.corner_smoothing);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -1073,8 +1095,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                        shadow.element_corner_radii);
+        let element_distance = quad_sdf_smooth(input.position.xy, shadow.element_bounds,
+        shadow.element_corner_radii, shadow.corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
     }
 

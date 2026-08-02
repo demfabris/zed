@@ -3960,7 +3960,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                corner_smoothing: self.default_corner_smoothing,
             });
         }
     }
@@ -4005,7 +4005,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                corner_smoothing: self.default_corner_smoothing,
             });
         }
     }
