@@ -1188,6 +1188,7 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     window_corner_mask: Option<(Bounds<Pixels>, Corners<Pixels>)>,
     default_corner_smoothing: f32,
+    adaptive_corner_fraction: Option<f32>,
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
@@ -1868,6 +1869,7 @@ impl Window {
             client_inset: None,
             window_corner_mask: None,
             default_corner_smoothing: 2.0,
+            adaptive_corner_fraction: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2533,6 +2535,31 @@ impl Window {
             self.default_corner_smoothing = smoothing;
             self.refresh();
         }
+    }
+
+    /// Hold every ordinary corner radius at `fraction` of the element's shorter
+    /// side, so that raising an application-wide radius setting can never turn
+    /// a component into a pill or a circle.
+    ///
+    /// `fraction` must be below `0.5`, the point at which a rounded rectangle
+    /// becomes a pill. Shapes that asked for [`crate::FULL_CORNER_RADIUS`]
+    /// (`rounded_full` and its per-corner variants) are declaring themselves
+    /// pills and are exempt. Pass `None`, the default, to keep the plain
+    /// behavior of clamping each radius at half the shorter side.
+    pub fn set_adaptive_corner_fraction(&mut self, fraction: Option<f32>) {
+        debug_assert!(
+            fraction.is_none_or(|fraction| (0.0..0.5).contains(&fraction)),
+            "an adaptive corner fraction must be below half the shorter side"
+        );
+        if self.adaptive_corner_fraction != fraction {
+            self.adaptive_corner_fraction = fraction;
+            self.refresh();
+        }
+    }
+
+    /// The active adaptive corner fraction, if the window has one.
+    pub fn adaptive_corner_fraction(&self) -> Option<f32> {
+        self.adaptive_corner_fraction
     }
 
     /// Returns whether the title bar window controls need to be rendered by the application (Wayland and X11)
@@ -7659,7 +7686,7 @@ mod tests {
         let any_window = window.into();
 
         cx.update_window(any_window, |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         })
         .unwrap();
 
@@ -7738,7 +7765,7 @@ mod tests {
         let any_window = window.into();
 
         cx.update_window(any_window, |_, window, cx| {
-            window.draw(cx).clear();
+            window.draw(cx).clear(cx);
         })
         .unwrap();
 
