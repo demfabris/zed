@@ -80,8 +80,9 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
-    // Scene-wide rounded clip (Scene::window_corner_mask); zero size disables it.
+    // Scene-wide rounded clip (Scene::window_corner_mask); zero size disables
+    // it. The smoothing rides in what was alignment padding.
+    window_mask_smoothing: f32,
     window_mask_origin: vec2<f32>,
     window_mask_size: vec2<f32>,
     window_mask_radii: vec4<f32>,
@@ -426,7 +427,10 @@ fn window_mask_alpha(position: vec2<f32>) -> f32 {
         globals.window_mask_radii.z,
         globals.window_mask_radii.w,
     );
-    let distance = quad_sdf(position, mask_bounds, mask_radii);
+    // The same curve the frame under it is drawn with, or the mask clips the
+    // frame's own border away over the arc where a circle and a squircle part.
+    let distance = quad_sdf_smooth(position, mask_bounds, mask_radii,
+        globals.window_mask_smoothing);
     return saturate(0.5 - distance);
 }
 
