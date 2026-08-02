@@ -555,6 +555,9 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    /// Superellipse exponent for the rounded corners: `2.0` is a circular
+    /// arc, `4.0` is a squircle (continuous corner).
+    pub corner_smoothing: f32,
 }
 
 impl From<Quad> for Primitive {

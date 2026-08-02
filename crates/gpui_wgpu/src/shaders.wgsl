@@ -370,20 +370,32 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners) -> f32 {
     let corner_radius = pick_corner_radius(center_to_point, corner_radii);
     let corner_to_point = abs(center_to_point) - half_size;
     let corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    return quad_sdf_impl(corner_center_to_point, corner_radius, 2.0);
 }
 
-fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32) -> f32 {
+// `corner_smoothing` is a superellipse exponent: 2 is a circular corner arc,
+// 4 is a squircle (continuous corner). Above 2 the distance is a p-norm rather
+// than a true SDF; it under-reads by up to ~16% near the corner diagonal,
+// which is well under a pixel at antialiasing scale.
+fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32, corner_smoothing: f32) -> f32 {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners.
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
-        // Signed distance of the point from a quad that is inset by corner_radius.
-        // It is negative inside this quad, and positive outside.
-        let signed_distance_to_inset_quad =
-            // 0 inside the inset quad, and positive outside.
-            length(max(vec2<f32>(0.0), corner_center_to_point)) +
-            // 0 outside the inset quad, and negative inside.
+        // 0 inside the quad inset by corner_radius, positive outside.
+        let outset = max(vec2<f32>(0.0), corner_center_to_point);
+        var outset_distance: f32;
+        if (corner_smoothing <= 2.001) {
+            outset_distance = length(outset);
+        } else {
+            outset_distance = pow(
+                pow(outset.x, corner_smoothing) + pow(outset.y, corner_smoothing),
+                1.0 / corner_smoothing);
+        }
+        // Signed distance of the point from the inset quad: adding the second
+        // term makes it negative inside, and subtracting the radius shifts the
+        // zero level set out to the rounded edge.
+        let signed_distance_to_inset_quad = outset_distance +
             min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
 
         return signed_distance_to_inset_quad - corner_radius;
@@ -547,6 +559,7 @@ struct Quad {
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
+    corner_smoothing: f32,
 }
 
 struct QuadVarying {
@@ -677,7 +690,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
-    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+    let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius, quad.corner_smoothing);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
