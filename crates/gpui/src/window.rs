@@ -4606,6 +4606,7 @@ impl Window {
             corner_smoothing: quad
                 .corner_smoothing
                 .unwrap_or(self.default_corner_smoothing),
+            pad: 0,
         };
 
         if !quad.background.is_transparent() {
