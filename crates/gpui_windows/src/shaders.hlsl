@@ -315,13 +315,23 @@ float quad_sdf_impl(float2 corner_center_to_point, float corner_radius,
 }
 
 float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
+    return quad_sdf_smooth(pt, bounds, corner_radii, 2.0);
+}
+
+// Distance to a rounded rect whose corners may be superelliptical. A fully
+// rounded rect is a circle or a pill, which keeps true arcs (see `fs_quad`).
+float quad_sdf_smooth(float2 pt, Bounds bounds, Corners corner_radii,
+                      float corner_smoothing) {
     float2 half_size = bounds.size / 2.;
     float2 center = bounds.origin + half_size;
     float2 center_to_point = pt - center;
     float corner_radius = pick_corner_radius(center_to_point, corner_radii);
     float2 corner_to_point = abs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius, 2.0);
+    float smoothing = corner_radius >= min(half_size.x, half_size.y) - 0.01
+        ? 2.0
+        : corner_smoothing;
+    return quad_sdf_impl(corner_center_to_point, corner_radius, smoothing);
 }
 
 GradientColor prepare_gradient_color(uint tag, uint color_space, Hsla solid, LinearColorStop colors[2]) {
@@ -598,6 +608,16 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     // Radius of the nearest corner
     float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
 
+    // A fully rounded quad is a circle or a pill rather than a rounded
+    // rectangle, and those read as shapes in their own right: smoothing one
+    // into a superellipse turns a switch thumb into a lozenge. Radii are
+    // clamped to half the shorter side before reaching the GPU, so testing for
+    // equality there selects exactly the fully rounded quads.
+    float corner_smoothing =
+        corner_radius >= min(half_size.x, half_size.y) - 0.01
+            ? 2.0
+            : quad.corner_smoothing;
+
     float2 border = float2(
         center_to_point.x < 0.0 ? quad.border_widths.left : quad.border_widths.right,
         center_to_point.y < 0.0 ? quad.border_widths.top : quad.border_widths.bottom
@@ -647,7 +667,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Signed distance of the point to the outside edge of the quad's border
     float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius,
-                                    quad.corner_smoothing);
+                                    corner_smoothing);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
@@ -875,7 +895,8 @@ struct Shadow {
     Bounds element_bounds;
     Corners element_corner_radii;
     uint inset;
-    uint pad; // align to 8 bytes
+    // Superellipse exponent for the corners; only honored when unblurred.
+    float corner_smoothing;
 };
 
 struct ShadowVertexOutput {
@@ -932,7 +953,8 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
 
     float alpha;
     if (shadow.blur_radius == 0.) {
-        float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        float distance = quad_sdf_smooth(input.position.xy, shadow.bounds,
+                                         shadow.corner_radii, shadow.corner_smoothing);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -957,8 +979,9 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                          shadow.element_corner_radii);
+        float element_distance = quad_sdf_smooth(input.position.xy, shadow.element_bounds,
+                                                 shadow.element_corner_radii,
+                                                 shadow.corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
     }
 
