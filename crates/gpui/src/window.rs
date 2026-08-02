@@ -1187,6 +1187,7 @@ pub struct Window {
     prompt: Option<RenderablePromptHandle>,
     pub(crate) client_inset: Option<Pixels>,
     window_corner_mask: Option<(Bounds<Pixels>, Corners<Pixels>)>,
+    default_corner_smoothing: f32,
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
@@ -1866,6 +1867,7 @@ impl Window {
             prompt: None,
             client_inset: None,
             window_corner_mask: None,
+            default_corner_smoothing: 2.0,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2518,6 +2520,17 @@ impl Window {
     pub fn set_window_corner_mask(&mut self, mask: Option<(Bounds<Pixels>, Corners<Pixels>)>) {
         if self.window_corner_mask != mask {
             self.window_corner_mask = mask;
+            self.refresh();
+        }
+    }
+
+    /// Sets the superellipse exponent used for rounded quad corners when a quad
+    /// doesn't specify its own: `2.0` (the default) is a circular arc, `4.0` is
+    /// a squircle (continuous corner). Quads override it via
+    /// [`PaintQuad::corner_smoothing`].
+    pub fn set_default_corner_smoothing(&mut self, smoothing: f32) {
+        if self.default_corner_smoothing != smoothing {
+            self.default_corner_smoothing = smoothing;
             self.refresh();
         }
     }
@@ -4060,6 +4073,9 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            corner_smoothing: quad
+                .corner_smoothing
+                .unwrap_or(self.default_corner_smoothing),
         };
 
         if !quad.background.is_transparent() {
@@ -6873,6 +6889,9 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// The superellipse exponent for the rounded corners (`2.0` = circular,
+    /// `4.0` = squircle). `None` uses the window's default.
+    pub corner_smoothing: Option<f32>,
 }
 
 impl PaintQuad {
@@ -6880,6 +6899,14 @@ impl PaintQuad {
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
         PaintQuad {
             corner_radii: corner_radii.into(),
+            ..self
+        }
+    }
+
+    /// Sets the superellipse exponent for the rounded corners.
+    pub fn corner_smoothing(self, corner_smoothing: f32) -> Self {
+        PaintQuad {
+            corner_smoothing: Some(corner_smoothing),
             ..self
         }
     }
@@ -6925,6 +6952,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: None,
     }
 }
 
@@ -6937,6 +6965,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
+        corner_smoothing: None,
     }
 }
 
@@ -6953,6 +6982,7 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: None,
     }
 }
 

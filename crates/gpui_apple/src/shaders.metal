@@ -27,7 +27,8 @@ float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
-float quad_sdf_impl(float2 center_to_point, float corner_radius);
+float quad_sdf_impl(float2 center_to_point, float corner_radius,
+                    float corner_smoothing);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
@@ -179,7 +180,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   // Signed distance of the point to the outside edge of the quad's border
-  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius,
+                                  quad.corner_smoothing);
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -1091,21 +1093,31 @@ float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
     float corner_radius = pick_corner_radius(center_to_point, corner_radii);
     float2 corner_to_point = fabs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    return quad_sdf_impl(corner_center_to_point, corner_radius, 2.0);
 }
 
-// Implementation of quad signed distance field
-float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+// Implementation of quad signed distance field. `corner_smoothing` is a
+// superellipse exponent: 2 is a circular corner arc, 4 is a squircle
+// (continuous corner). Above 2 the distance is a p-norm rather than a true
+// SDF; it under-reads by up to ~16% near the corner diagonal, which is well
+// under a pixel at antialiasing scale.
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius,
+                    float corner_smoothing) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
-        // Signed distance of the point from a quad that is inset by corner_radius
-        // It is negative inside this quad, and positive outside
-        float signed_distance_to_inset_quad =
-            // 0 inside the inset quad, and positive outside
-            length(max(float2(0.0), corner_center_to_point)) +
-            // 0 outside the inset quad, and negative inside
+        // 0 inside the quad inset by corner_radius, positive outside
+        float2 outset = max(float2(0.0), corner_center_to_point);
+        float outset_distance = corner_smoothing <= 2.001
+            ? length(outset)
+            : pow(pow(outset.x, corner_smoothing) +
+                      pow(outset.y, corner_smoothing),
+                  1.0 / corner_smoothing);
+        // Signed distance of the point from the inset quad: adding the second
+        // term makes it negative inside, and subtracting the radius shifts the
+        // zero level set out to the rounded edge.
+        float signed_distance_to_inset_quad = outset_distance +
             min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
 
         return signed_distance_to_inset_quad - corner_radius;
