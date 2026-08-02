@@ -2935,6 +2935,7 @@ impl Window {
                 .map(|(bounds, corner_radii)| WindowCornerMask {
                     bounds: bounds.scale(scale_factor),
                     corner_radii: corner_radii.scale(scale_factor),
+                    corner_smoothing: self.default_corner_smoothing,
                 });
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;

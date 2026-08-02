@@ -60,8 +60,9 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
-    // Scene-wide rounded clip (Scene::window_corner_mask); zero size disables it.
+    // Scene-wide rounded clip (Scene::window_corner_mask); zero size disables
+    // it. The smoothing rides in what was alignment padding.
+    window_mask_smoothing: f32,
     window_mask_origin: [f32; 2],
     window_mask_size: [f32; 2],
     window_mask_radii: [f32; 4],
@@ -1338,7 +1339,7 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            pad: 0,
+            window_mask_smoothing: window_mask.corner_smoothing,
             window_mask_origin: [window_mask.bounds.origin.x.0, window_mask.bounds.origin.y.0],
             window_mask_size: [
                 window_mask.bounds.size.width.0,
