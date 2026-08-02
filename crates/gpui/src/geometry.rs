@@ -2464,6 +2464,54 @@ impl<T: Div<f32, Output = T> + Ord + Clone + Debug + Default + PartialEq> Corner
     ///
     /// Anchor radii values clamped to fit.
     #[must_use]
+    /// Resolve these radii against the element they round, so that an ordinary
+    /// radius can never turn the element into a pill or a circle.
+    ///
+    /// A radius is only a *request*: [`Self::clamp_radii_for_quad_size`] caps it
+    /// at half the shorter side, which is the point where a rounded rectangle
+    /// stops existing. One global radius setting applied to components of
+    /// different sizes therefore makes each of them change shape category at a
+    /// different value — a 24px button at 12, a 30px input at 15 — which reads
+    /// as a bug rather than a setting.
+    ///
+    /// So an ordinary corner approaches `fraction` of the shorter side without
+    /// ever reaching it, along `cap * tanh(radius / cap)`. Near zero that is
+    /// the requested radius to within a fraction of a pixel, so the setting
+    /// behaves normally over the range that matters; beyond it the curve bends
+    /// instead of stopping. A hard cap would only move the cliff: the radius
+    /// would still stop responding abruptly, at a different setting for each
+    /// component, which is the same defect in a quieter form.
+    ///
+    /// A corner that asked for [`FULL_CORNER_RADIUS`] is a deliberate pill or
+    /// circle (`rounded_full` and friends) and still resolves to exactly half,
+    /// at every setting including zero. Pill is a category a widget declares,
+    /// never somewhere an ordinary radius arrives.
+    pub fn resolve_radii_for_quad_size(self, size: Size<Pixels>, fraction: f32) -> Corners<Pixels>
+    where
+        T: Into<Pixels>,
+    {
+        let shorter_side = cmp::min(size.width, size.height);
+        let full = shorter_side / 2.;
+        let cap = shorter_side * fraction;
+        let resolve = |radius: T| {
+            let radius: Pixels = radius.into();
+            if radius >= FULL_CORNER_RADIUS {
+                full
+            } else if cap > Pixels::ZERO {
+                cap * (radius / cap).tanh()
+            } else {
+                Pixels::ZERO
+            }
+        };
+
+        Corners {
+            top_left: resolve(self.top_left),
+            top_right: resolve(self.top_right),
+            bottom_right: resolve(self.bottom_right),
+            bottom_left: resolve(self.bottom_left),
+        }
+    }
+
     pub fn clamp_radii_for_quad_size(self, size: Size<T>) -> Corners<T> {
         let max = cmp::min(size.width, size.height) / 2.;
         Corners {
@@ -3737,6 +3785,16 @@ pub const fn px(pixels: f32) -> Pixels {
     Pixels(pixels)
 }
 
+/// The radius `rounded_full` and its per-corner variants set: far larger than
+/// any element, so it always resolves to the largest corner the element can
+/// take.
+///
+/// It doubles as the declaration that a shape is *deliberately* a pill or a
+/// circle, which is what lets
+/// [`Corners::resolve_radii_for_quad_size`](crate::Corners::resolve_radii_for_quad_size)
+/// tell one apart from an ordinary radius that merely grew large.
+pub const FULL_CORNER_RADIUS: Pixels = px(9999.);
+
 /// Returns a `Length` representing an automatic length.
 ///
 /// The `auto` length is often used in layout calculations where the length should be determined
@@ -3965,6 +4023,93 @@ where
             && self.top_right.is_zero()
             && self.bottom_right.is_zero()
             && self.bottom_left.is_zero()
+    }
+}
+
+#[cfg(test)]
+mod adaptive_corner_tests {
+    use super::{Corners, FULL_CORNER_RADIUS, px, size};
+
+    const FRACTION: f32 = 0.45;
+
+    fn resolved(radius: f32, width: f32, height: f32) -> Corners<crate::Pixels> {
+        Corners::all(px(radius)).resolve_radii_for_quad_size(size(px(width), px(height)), FRACTION)
+    }
+
+    #[test]
+    fn an_ordinary_radius_never_reaches_a_full_round() {
+        // The whole point: one setting sweeping its entire range must not make
+        // any component change shape category, at any size or UI scale.
+        for radius in 0..=256 {
+            for side in [12.0, 16.0, 18.0, 24.0, 28.0, 30.0, 36.0, 40.0, 120.0] {
+                let corner = resolved(radius as f32, side * 3.0, side);
+                assert!(
+                    corner.top_left < px(side / 2.0),
+                    "radius {radius} on a {side}px side gave {:?}, which is a pill",
+                    corner.top_left
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_declared_full_corner_stays_full() {
+        // `rounded_full` has to survive the policy, including at radius 0.
+        let corners = Corners::all(FULL_CORNER_RADIUS)
+            .resolve_radii_for_quad_size(size(px(84.0), px(28.0)), FRACTION);
+        assert_eq!(corners.top_left, px(14.0));
+    }
+
+    #[test]
+    fn a_small_radius_is_near_enough_the_request() {
+        // The curve is the requested radius to well under a pixel where a
+        // corner radius is actually set, so the setting behaves normally.
+        for radius in [1.0, 2.0, 3.0, 4.0, 6.0, 8.0] {
+            let corner = resolved(radius, 84.0, 28.0).top_left;
+            assert!(
+                (corner - px(radius)).abs() < px(1.0),
+                "radius {radius} resolved to {corner:?}, too far from the request"
+            );
+        }
+    }
+
+    #[test]
+    fn the_radius_never_stops_responding() {
+        // The point of the curve over a hard cap: no component's corner stops
+        // moving while its neighbours keep going, which is what reads as "some
+        // widgets changed and others did not". Strictly over the range a corner
+        // radius is plausibly set, and never backwards anywhere.
+        for side in [16.0, 24.0, 28.0, 36.0] {
+            let mut previous = resolved(0.0, side * 3.0, side).top_left;
+            for radius in 1..=256 {
+                let corner = resolved(radius as f32, side * 3.0, side).top_left;
+                if radius <= 24 {
+                    assert!(
+                        corner > previous,
+                        "a {side}px control stopped responding at radius {radius}"
+                    );
+                } else {
+                    // Far out the curve is flat to within f32, which is the
+                    // asymptote doing its job rather than a cliff.
+                    assert!(corner >= previous, "a {side}px control went backwards");
+                }
+                previous = corner;
+            }
+        }
+    }
+
+    #[test]
+    fn each_corner_resolves_on_its_own() {
+        // `rounded_t_full` is a real shape: full on top, ordinary below.
+        let corners = Corners {
+            top_left: FULL_CORNER_RADIUS,
+            top_right: FULL_CORNER_RADIUS,
+            bottom_right: px(40.0),
+            bottom_left: px(40.0),
+        }
+        .resolve_radii_for_quad_size(size(px(84.0), px(28.0)), FRACTION);
+        assert_eq!(corners.top_left, px(14.0));
+        assert!(corners.bottom_right < px(14.0));
     }
 }
 

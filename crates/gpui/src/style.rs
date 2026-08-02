@@ -703,10 +703,15 @@ impl Style {
         }
 
         let rem_size = window.rem_size();
-        let corner_radii = self
-            .corner_radii
-            .to_pixels(rem_size)
-            .clamp_radii_for_quad_size(bounds.size);
+        // The one place an element's requested radii meet its laid-out size, so
+        // the one place the shape policy can be applied without every widget
+        // repeating it. Fill, border and both shadow passes below share the
+        // result, which is what keeps them tracing the same curve.
+        let requested_radii = self.corner_radii.to_pixels(rem_size);
+        let corner_radii = match window.adaptive_corner_fraction() {
+            Some(fraction) => requested_radii.resolve_radii_for_quad_size(bounds.size, fraction),
+            None => requested_radii.clamp_radii_for_quad_size(bounds.size),
+        };
 
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
 
