@@ -528,6 +528,7 @@ struct Quad {
     Corners corner_radii;
     Edges border_widths;
     float corner_smoothing;
+    uint pad; // align to 8 bytes
 };
 
 struct QuadVertexOutput {
