@@ -27,6 +27,8 @@ float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii);
+float quad_sdf_smooth(float2 point, Bounds_ScaledPixels bounds,
+                      Corners_ScaledPixels corner_radii, float corner_smoothing);
 float quad_sdf_impl(float2 center_to_point, float corner_radius,
                     float corner_smoothing);
 float gaussian(float x, float sigma);
@@ -131,6 +133,16 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   // Radius of the nearest corner
   float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
 
+  // A fully rounded quad is a circle or a pill rather than a rounded
+  // rectangle, and those read as shapes in their own right: smoothing one into
+  // a superellipse turns a switch thumb into a lozenge. Radii are clamped to
+  // half the shorter side before reaching the GPU, so testing for equality
+  // there selects exactly the fully rounded quads.
+  float corner_smoothing =
+    corner_radius >= min(half_size.x, half_size.y) - 0.01
+      ? 2.0
+      : quad.corner_smoothing;
+
   // Width of the nearest borders
   float2 border = float2(
     center_to_point.x < 0.0 ? quad.border_widths.left : quad.border_widths.right,
@@ -181,7 +193,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Signed distance of the point to the outside edge of the quad's border
   float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius,
-                                  quad.corner_smoothing);
+                                  corner_smoothing);
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -523,7 +535,8 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf_smooth(input.position.xy, shadow.bounds,
+                                     shadow.corner_radii, shadow.corner_smoothing);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -548,8 +561,9 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
-    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
+    float element_distance = quad_sdf_smooth(input.position.xy, shadow.element_bounds,
+                                             shadow.element_corner_radii,
+                                             shadow.corner_smoothing);
     alpha *= saturate(0.5 - element_distance);
   }
 
@@ -1087,13 +1101,23 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 // border, and negative inside.
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
                Corners_ScaledPixels corner_radii) {
+    return quad_sdf_smooth(point, bounds, corner_radii, 2.0);
+}
+
+// Distance to a rounded rect whose corners may be superelliptical. A fully
+// rounded rect is a circle or a pill, which keeps true arcs (see `fs_quad`).
+float quad_sdf_smooth(float2 point, Bounds_ScaledPixels bounds,
+                      Corners_ScaledPixels corner_radii, float corner_smoothing) {
     float2 half_size = float2(bounds.size.width, bounds.size.height) / 2.0;
     float2 center = float2(bounds.origin.x, bounds.origin.y) + half_size;
     float2 center_to_point = point - center;
     float corner_radius = pick_corner_radius(center_to_point, corner_radii);
     float2 corner_to_point = fabs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius, 2.0);
+    float smoothing = corner_radius >= min(half_size.x, half_size.y) - 0.01
+        ? 2.0
+        : corner_smoothing;
+    return quad_sdf_impl(corner_center_to_point, corner_radius, smoothing);
 }
 
 // Implementation of quad signed distance field. `corner_smoothing` is a
