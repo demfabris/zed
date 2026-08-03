@@ -1,3 +1,5 @@
+#[cfg(target_os = "windows")]
+use crate::DirectXDeviceContext;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 #[cfg(feature = "profiler")]
@@ -2647,6 +2649,12 @@ impl Window {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn wgpu_device_context(&self) -> Option<WgpuDeviceContext> {
         self.platform_window.wgpu_device_context()
+    }
+
+    /// Returns the device and immediate context used by this window's DirectX renderer.
+    #[cfg(target_os = "windows")]
+    pub fn directx_device_context(&self) -> Option<DirectXDeviceContext> {
+        self.platform_window.directx_device_context()
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the

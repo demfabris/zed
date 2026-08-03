@@ -723,6 +723,14 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    pub(crate) fn device_context(&self) -> Option<DirectXDeviceContext> {
+        let devices = self.devices.as_ref()?;
+        Some(DirectXDeviceContext {
+            device: devices.device.clone(),
+            device_context: devices.device_context.clone(),
+        })
+    }
+
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let desc = unsafe { devices.adapter.GetDesc1() }?;

@@ -1008,6 +1008,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().gpu_specs().log_err()
     }
 
+    fn directx_device_context(&self) -> Option<DirectXDeviceContext> {
+        self.state.renderer.borrow().device_context()
+    }
+
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let scale_factor = self.state.scale_factor.get();
         let caret_position = POINT {

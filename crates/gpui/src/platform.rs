@@ -748,6 +748,20 @@ pub struct WgpuDeviceContext {
     pub queue: Arc<wgpu::Queue>,
 }
 
+/// The device and immediate context used by GPUI's DirectX renderer.
+///
+/// Both are COM pointers, so cloning this only bumps their refcounts. Callers
+/// that need a newer interface (`ID3D11Device1` and friends) should `cast()`
+/// the device themselves.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+pub struct DirectXDeviceContext {
+    /// The renderer's current device.
+    pub device: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    /// The renderer's current immediate context.
+    pub device_context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+}
+
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
 ///
 /// `Inactive` means visible but not receiving input (a system dialog on
@@ -932,6 +946,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn wgpu_device_context(&self) -> Option<WgpuDeviceContext> {
+        None
+    }
+
+    #[cfg(target_os = "windows")]
+    fn directx_device_context(&self) -> Option<DirectXDeviceContext> {
         None
     }
 
