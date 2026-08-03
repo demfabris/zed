@@ -314,6 +314,9 @@ float quad_sdf_impl(float2 corner_center_to_point, float corner_radius,
     }
 }
 
+float quad_sdf_smooth(float2 pt, Bounds bounds, Corners corner_radii,
+                      float corner_smoothing);
+
 float quad_sdf(float2 pt, Bounds bounds, Corners corner_radii) {
     return quad_sdf_smooth(pt, bounds, corner_radii, 2.0);
 }
