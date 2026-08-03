@@ -809,6 +809,8 @@ pub struct PaintSurface {
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub texture_view: wgpu::TextureView,
+    #[cfg(target_os = "windows")]
+    pub texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
 }
 
 impl From<PaintSurface> for Primitive {

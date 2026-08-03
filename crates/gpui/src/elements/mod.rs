@@ -4,7 +4,7 @@ mod canvas;
 mod container_query;
 mod deferred;
 mod div;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 mod external_texture;
 mod image_cache;
 mod img;
@@ -20,7 +20,7 @@ pub use canvas::*;
 pub use container_query::*;
 pub use deferred::*;
 pub use div::*;
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
 pub use external_texture::*;
 pub use image_cache::*;
 pub use img::*;

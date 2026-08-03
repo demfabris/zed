@@ -92,12 +92,14 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    surfaces: PipelineState<Surface>,
 }
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     batch_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    surface_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -371,7 +373,10 @@ impl DirectXRenderer {
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
-                PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::Surfaces(range) => {
+                    let start = range.start;
+                    self.draw_surfaces(start, &scene.surfaces[range])
+                }
             }
             .with_context(|| {
                 format!(
@@ -483,6 +488,22 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.polychrome_sprites,
+            )?;
+        }
+
+        if !scene.surfaces.is_empty() {
+            let surfaces = scene
+                .surfaces
+                .iter()
+                .map(|surface| Surface {
+                    bounds: surface.bounds,
+                    content_mask: surface.content_mask.bounds,
+                })
+                .collect::<Vec<_>>();
+            self.pipelines.surfaces.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &surfaces,
             )?;
         }
 
@@ -716,9 +737,31 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
+    fn draw_surfaces(&mut self, start: usize, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        for (offset, surface) in surfaces.iter().enumerate() {
+            // The view is built per draw rather than cached against the texture
+            // pointer: the embedder owns these textures and may recycle a slot
+            // between frames, which would leave a cached view sampling a stale
+            // resource. Creating one is cheap next to the copy that filled it.
+            let Some(view) = create_texture_view(&devices.device, &surface.texture).log_err()
+            else {
+                continue;
+            };
+            self.pipelines.surfaces.draw_range_with_texture(
+                &devices.device,
+                &devices.device_context,
+                slice::from_ref(&view),
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.surface_sampler),
+                (start + offset) as u32,
+                1,
+            )?;
         }
         Ok(())
     }
@@ -908,6 +951,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let surfaces = PipelineState::new(
+            device,
+            "surface_pipeline",
+            ShaderModule::Surface,
+            4,
+            create_blend_state_for_premultiplied_alpha(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -918,6 +968,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            surfaces,
         })
     }
 }
@@ -968,10 +1019,31 @@ impl DirectXGlobalElements {
             output
         };
 
+        // External textures are sampled edge to edge, so they clamp instead of
+        // wrapping: filtering at the border must not pull in the far edge.
+        let surface_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             batch_params_buffer,
             sampler,
+            surface_sampler,
         })
     }
 }
@@ -1191,6 +1263,17 @@ struct PathRasterizationSprite {
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
+
+/// The GPU-facing half of a [`PaintSurface`]: the texture travels out of band,
+/// bound per draw, because each surface samples a different one.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Surface {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+}
+
+const _: () = assert!(size_of::<Surface>() % 8 == 0);
 
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
@@ -1481,6 +1564,36 @@ fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11Ble
     }
 }
 
+/// Blends a source that already carries its alpha into its colour channels,
+/// which is what external textures hand us.
+#[inline]
+fn create_blend_state_for_premultiplied_alpha(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = true.into();
+    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
+fn create_texture_view(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+) -> Result<Option<ID3D11ShaderResourceView>> {
+    let mut view = None;
+    unsafe { device.CreateShaderResourceView(texture, None, Some(&mut view)) }?;
+    Ok(view)
+}
+
 #[inline]
 fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11VertexShader> {
     unsafe {
@@ -1627,6 +1740,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        Surface,
         EmojiRasterization,
     }
 
@@ -1700,6 +1814,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::Surface => match target {
+                    ShaderTarget::Vertex => SURFACE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SURFACE_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1791,6 +1909,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::Surface => "surface",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }
