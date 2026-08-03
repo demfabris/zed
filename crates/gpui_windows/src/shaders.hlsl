@@ -1302,3 +1302,48 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Surfaces
+**
+*/
+
+struct Surface {
+    Bounds bounds;
+    Bounds content_mask;
+};
+
+struct SurfaceVertexOutput {
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct SurfaceFragmentInput {
+    float4 position: SV_Position;
+    float2 texture_position: POSITION;
+};
+
+StructuredBuffer<Surface> surfaces: register(t1);
+
+SurfaceVertexOutput surface_vertex(uint vertex_id: SV_VertexID, uint surface_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    Surface surface = surfaces[surface_id];
+    float4 device_position = to_device_position(unit_vertex, surface.bounds);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
+                                                    surface.content_mask);
+
+    SurfaceVertexOutput output;
+    output.position = device_position;
+    // The whole texture is stretched over the element's bounds; the element has
+    // already applied its object fit to them.
+    output.texture_position = unit_vertex;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 surface_fragment(SurfaceFragmentInput input): SV_Target {
+    // The texture is already premultiplied, so it is blended as-is.
+    return t_sprite.Sample(s_sprite, input.texture_position);
+}

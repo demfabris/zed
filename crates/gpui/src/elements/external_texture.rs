@@ -4,20 +4,50 @@ use crate::{
 };
 use refineable::Refineable;
 
-/// An element that paints a texture created on GPUI's wgpu device.
+/// The handle the renderer samples for an [`ExternalTexture`]: a view on the
+/// wgpu backends, and the texture itself on DirectX, where the shader resource
+/// view is created per draw.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+type ExternalTextureHandle = wgpu::TextureView;
+#[cfg(target_os = "windows")]
+type ExternalTextureHandle = windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+
+/// An element that paints a texture created on GPUI's device.
 pub struct ExternalTexture {
-    view: wgpu::TextureView,
+    handle: ExternalTextureHandle,
     size: Size<DevicePixels>,
     object_fit: ObjectFit,
     style: StyleRefinement,
 }
 
 /// Creates an element that paints a texture created on GPUI's wgpu device.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn external_texture(texture: wgpu::Texture) -> ExternalTexture {
     let extent = texture.size();
     ExternalTexture {
-        view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        handle: texture.create_view(&wgpu::TextureViewDescriptor::default()),
         size: size(extent.width.into(), extent.height.into()),
+        object_fit: ObjectFit::Contain,
+        style: Default::default(),
+    }
+}
+
+/// Creates an element that paints a texture created on GPUI's DirectX device.
+///
+/// The texture is sampled as premultiplied BGRA and must stay alive for as long
+/// as the element does; holding the interface here keeps it referenced.
+#[cfg(target_os = "windows")]
+pub fn external_texture(
+    texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+) -> ExternalTexture {
+    let desc = unsafe {
+        let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut desc);
+        desc
+    };
+    ExternalTexture {
+        handle: texture,
+        size: size((desc.Width as i32).into(), (desc.Height as i32).into()),
         object_fit: ObjectFit::Contain,
         style: Default::default(),
     }
@@ -78,7 +108,7 @@ impl Element for ExternalTexture {
         _: &mut App,
     ) {
         let bounds = self.object_fit.get_bounds(bounds, self.size);
-        window.paint_external_texture(bounds, self.view.clone());
+        window.paint_external_texture(bounds, self.handle.clone());
     }
 }
 
