@@ -167,6 +167,9 @@ pub use window::*;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub use wgpu;
 
+#[cfg(target_os = "windows")]
+pub use windows;
+
 #[cfg(not(target_family = "wasm"))]
 pub use pollster::block_on;
 
