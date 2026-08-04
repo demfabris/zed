@@ -1402,12 +1402,16 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) in
 
 @fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
-    // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let sample = textureSample(t_sprite, s_sprite, input.texture_position);
+    // Explicitly level 0, not `textureSample`: sampling with implicit
+    // derivatives is only allowed in uniform control flow, and the clip above
+    // makes this call non-uniform. Metal and D3D let that slide, but WebGPU
+    // rejects the whole shader module, which takes every pipeline in it down.
+    // Surface textures have no mips, so level 0 is what sampling meant anyway.
+    let sample = textureSampleLevel(t_sprite, s_sprite, input.texture_position, 0.0);
     let mask = window_mask_alpha(input.position.xy);
     if (globals.premultiplied_alpha != 0u) {
         return sample * mask;
