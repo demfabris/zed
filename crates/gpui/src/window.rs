@@ -18,12 +18,12 @@ use crate::{
     Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
     PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
     RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowCornerMask, WindowDecorations, WindowOptions, WindowParams,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
+    ScrollDelta, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowCornerMask, WindowDecorations, WindowOptions, WindowParams,
     WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 
@@ -87,6 +87,30 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     width: Pixels(900.),
     height: Pixels(750.),
 };
+
+/// The range [`Window::set_zoom`] accepts. Past either end a window is no longer
+/// operable, so the clamp only has to keep callers inside the usable band.
+pub const MIN_WINDOW_ZOOM: f32 = 0.25;
+/// See [`MIN_WINDOW_ZOOM`].
+pub const MAX_WINDOW_ZOOM: f32 = 4.0;
+
+/// The platform's metrics as the element tree sees them.
+///
+/// Zoom multiplies the scale factor and divides the viewport, so layout shrinks
+/// while rasterization grows: the scene still fills the unchanged physical
+/// drawable, only at a larger visual scale. Every consumer reads the cached
+/// values, so folding zoom in here is what makes it apply to the whole tree.
+///
+/// `Window::scale_factor` and `Window::viewport_size` must only ever be written
+/// from this function — the test-only `set_scale_factor` override aside, which
+/// fakes the platform scale on purpose — or zoom silently stops applying to
+/// whichever path skipped it.
+fn zoomed_platform_metrics(platform_window: &dyn PlatformWindow, zoom: f32) -> (f32, Size<Pixels>) {
+    (
+        platform_window.scale_factor() * zoom,
+        platform_window.content_size().map(|length| length / zoom),
+    )
+}
 
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
@@ -1163,6 +1187,8 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    /// Folded into `scale_factor` and out of `viewport_size`; see [`Window::set_zoom`].
+    zoom: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1404,8 +1430,8 @@ impl Window {
         let mouse_position = platform_window.mouse_position();
         let modifiers = platform_window.modifiers();
         let capslock = platform_window.capslock();
-        let content_size = platform_window.content_size();
-        let scale_factor = platform_window.scale_factor();
+        let zoom = 1.0;
+        let (scale_factor, content_size) = zoomed_platform_metrics(&*platform_window, zoom);
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
@@ -1848,6 +1874,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            zoom,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2143,7 +2170,14 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        // The caller works in zoomed logical px; the compositor wants real points.
+        let zoomed = region.map(|rects| {
+            rects
+                .iter()
+                .map(|rect| rect.map(|length| length * self.zoom))
+                .collect::<SmallVec<[_; 8]>>()
+        });
+        self.platform_window.set_input_region(zoomed.as_deref());
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -2407,10 +2441,9 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        self.sync_platform_metrics();
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
+        self.mouse_position = self.platform_window.mouse_position() / self.zoom;
 
         self.refresh();
 
@@ -2494,7 +2527,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        // Callers pass a position off a mouse event, so it is in zoomed logical px.
+        self.platform_window.show_window_menu(position * self.zoom)
     }
 
     /// Handle window movement for Linux and macOS.
@@ -2507,8 +2541,10 @@ impl Window {
 
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
+        // Kept in logical px for the layout that reads it back, handed to the
+        // compositor in real points.
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window.set_client_inset(inset * self.zoom);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -2643,6 +2679,40 @@ impl Window {
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
+    }
+
+    /// The window's content zoom. `1.0` is unzoomed.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Zoom this window's content, like a browser's zoom control.
+    ///
+    /// The multiplier is folded into the effective scale factor and out of the
+    /// logical viewport, so the entire element tree — hardcoded pixel metrics,
+    /// borders and shadows included, not just rem-derived typography — lays out
+    /// smaller and rasterizes larger. Text stays crisp because it re-rasterizes
+    /// at the new scale rather than being resampled.
+    ///
+    /// Window geometry is unaffected: `bounds`, resizing and the traffic-light
+    /// inset stay in real platform points. Only content scales.
+    ///
+    /// Clamped to [`MIN_WINDOW_ZOOM`]..=[`MAX_WINDOW_ZOOM`].
+    pub fn set_zoom(&mut self, zoom: f32) {
+        let zoom = zoom.clamp(MIN_WINDOW_ZOOM, MAX_WINDOW_ZOOM);
+        if zoom == self.zoom {
+            return;
+        }
+
+        self.zoom = zoom;
+        self.sync_platform_metrics();
+        self.refresh();
+    }
+
+    /// Re-derive the cached platform metrics through the current zoom.
+    fn sync_platform_metrics(&mut self) {
+        (self.scale_factor, self.viewport_size) =
+            zoomed_platform_metrics(&*self.platform_window, self.zoom);
     }
 
     /// Returns the device and queue used by this window's wgpu renderer.
@@ -5168,11 +5238,52 @@ impl Window {
             .unwrap_or_else(|| action.name().to_string())
     }
 
+    /// Rewrite a platform event's real-point coordinates into the window's zoomed
+    /// logical space.
+    ///
+    /// Hit testing, `mouse_position` and every element bound live in that space,
+    /// so this has to run before anything downstream caches a position. Line-unit
+    /// scroll deltas are already resolution independent and stay untouched.
+    fn unzoom_input(&self, mut event: PlatformInput) -> PlatformInput {
+        let zoom = self.zoom;
+        if zoom == 1.0 {
+            return event;
+        }
+
+        match &mut event {
+            PlatformInput::MouseDown(event) => event.position = event.position / zoom,
+            PlatformInput::MouseUp(event) => event.position = event.position / zoom,
+            PlatformInput::MouseMove(event) => event.position = event.position / zoom,
+            PlatformInput::MouseExited(event) => event.position = event.position / zoom,
+            PlatformInput::MousePressure(event) => event.position = event.position / zoom,
+            PlatformInput::Pinch(event) => event.position = event.position / zoom,
+            PlatformInput::Touch(event) => event.position = event.position / zoom,
+            PlatformInput::ScrollWheel(event) => {
+                event.position = event.position / zoom;
+                if let ScrollDelta::Pixels(delta) = &mut event.delta {
+                    *delta = *delta / zoom;
+                }
+            }
+            PlatformInput::FileDrop(
+                FileDropEvent::Entered { position, .. }
+                | FileDropEvent::Pending { position }
+                | FileDropEvent::Submit { position },
+            ) => *position = *position / zoom,
+            PlatformInput::FileDrop(FileDropEvent::Exited | FileDropEvent::Ended)
+            | PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_) => {}
+        }
+
+        event
+    }
+
     /// Dispatch a mouse or keyboard event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input();
+        let event = self.unzoom_input(event);
         let update_count_before = self.invalidator.update_count();
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
@@ -7057,9 +7168,10 @@ mod tests {
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
-        MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, VisualTestContext, Window,
+        InputEvent as _, InteractiveElement as _, IntoElement, MAX_WINDOW_ZOOM, MIN_WINDOW_ZOOM,
+        Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point,
+        Render, RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext,
+        VisualTestContext, Window,
         WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
 
@@ -7833,5 +7945,130 @@ mod tests {
             dropped.get(),
             "a rejected can_drop consumed the drag instead of passing it through"
         );
+    }
+
+    struct ZoomView {
+        child_bounds: Rc<Cell<Bounds<Pixels>>>,
+        mouse_downs: Rc<RefCell<Vec<Point<Pixels>>>>,
+    }
+
+    impl Render for ZoomView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let child_bounds = self.child_bounds.clone();
+            let mouse_downs = self.mouse_downs.clone();
+            div()
+                .id("zoom-target")
+                .w(px(100.))
+                .h(px(100.))
+                .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, _| {
+                    mouse_downs.borrow_mut().push(event.position);
+                })
+                .child(
+                    canvas(
+                        move |bounds, _, _| child_bounds.set(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .size_full(),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn zoom_scales_the_metrics_the_element_tree_reads(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+
+        let (base_scale_factor, base_viewport_size) = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                assert_eq!(window.zoom(), 1.0);
+                (window.scale_factor(), window.viewport_size())
+            })
+            .unwrap();
+
+        cx.update_window(window.into(), |_, window, _| {
+            // Zooming in: layout shrinks and rasterization grows, so the scene
+            // still fills the unchanged physical drawable.
+            window.set_zoom(2.0);
+            assert_eq!(window.zoom(), 2.0);
+            assert_eq!(window.scale_factor(), base_scale_factor * 2.0);
+            assert_eq!(
+                window.viewport_size(),
+                base_viewport_size.map(|length| length / 2.0)
+            );
+
+            window.set_zoom(0.5);
+            assert_eq!(window.scale_factor(), base_scale_factor * 0.5);
+            assert_eq!(
+                window.viewport_size(),
+                base_viewport_size.map(|length| length * 2.0)
+            );
+
+            // Out-of-range values clamp rather than producing a degenerate viewport.
+            window.set_zoom(MAX_WINDOW_ZOOM * 2.0);
+            assert_eq!(window.zoom(), MAX_WINDOW_ZOOM);
+            window.set_zoom(0.0);
+            assert_eq!(window.zoom(), MIN_WINDOW_ZOOM);
+
+            window.set_zoom(1.0);
+            assert_eq!(window.scale_factor(), base_scale_factor);
+            assert_eq!(window.viewport_size(), base_viewport_size);
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn zoom_maps_platform_positions_into_logical_space(cx: &mut TestAppContext) {
+        let child_bounds = Rc::new(Cell::new(Bounds::default()));
+        let mouse_downs = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let child_bounds = child_bounds.clone();
+            let mouse_downs = mouse_downs.clone();
+            move |_, _| ZoomView {
+                child_bounds,
+                mouse_downs,
+            }
+        });
+
+        let click_at = |cx: &mut TestAppContext, position| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.mouse_position()
+            })
+            .unwrap()
+        };
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.set_zoom(2.0);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        // The element keeps its logical size; only the space it maps onto shrinks.
+        assert_eq!(child_bounds.get().size, size(px(100.), px(100.)));
+
+        // A click the platform reports at 150 physical points lands on the
+        // element covering logical 75.
+        assert_eq!(
+            click_at(cx, point(px(150.), px(150.))),
+            point(px(75.), px(75.))
+        );
+        assert_eq!(*mouse_downs.borrow(), vec![point(px(75.), px(75.))]);
+
+        // 250 physical points is logical 125, past the element's 100px edge.
+        assert_eq!(
+            click_at(cx, point(px(250.), px(250.))),
+            point(px(125.), px(125.))
+        );
+        assert_eq!(mouse_downs.borrow().len(), 1);
     }
 }
