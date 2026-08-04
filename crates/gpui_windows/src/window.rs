@@ -881,17 +881,34 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
 
-        // using Dwm APIs for Mica and MicaAlt backdrops.
-        // others follow the set_window_composition_attribute approach
+        // using Dwm APIs for Mica, MicaAlt and (where available) Acrylic
+        // backdrops. others follow the set_window_composition_attribute
+        // approach
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
                 set_window_composition_attribute(hwnd, None, 0);
+                // DWMSBT_NONE, so leaving a backdrop appearance actually
+                // clears it
+                dwm_set_window_composition_attribute(hwnd, 1);
             }
             WindowBackgroundAppearance::Transparent => {
                 set_window_composition_attribute(hwnd, None, 2);
+                // DWMSBT_NONE
+                dwm_set_window_composition_attribute(hwnd, 1);
             }
             WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                if system_backdrop_supported() {
+                    // The undocumented acrylic accent stopped blurring on the
+                    // builds that ship the documented backdrop API, so prefer
+                    // that: DWMSBT_TRANSIENTWINDOW => Acrylic. The accent is
+                    // reset so the appearance does not depend on the previous
+                    // one; per-pixel alpha comes from the composition
+                    // swapchain, not the accent.
+                    set_window_composition_attribute(hwnd, None, 0);
+                    dwm_set_window_composition_attribute(hwnd, 3);
+                } else {
+                    set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                }
             }
             WindowBackgroundAppearance::MicaBackdrop => {
                 // DWMSBT_MAINWINDOW => MicaBase
@@ -1543,13 +1560,16 @@ fn retrieve_window_placement(
     Ok(placement)
 }
 
-fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
+// DWMWA_SYSTEMBACKDROP_TYPE is available only on version 22621 or later
+// using SetWindowCompositionAttributeType as a fallback
+fn system_backdrop_supported() -> bool {
     let mut version = unsafe { std::mem::zeroed() };
     let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+    status.is_ok() && version.dwBuildNumber >= 22621
+}
 
-    // DWMWA_SYSTEMBACKDROP_TYPE is available only on version 22621 or later
-    // using SetWindowCompositionAttributeType as a fallback
-    if !status.is_ok() || version.dwBuildNumber < 22621 {
+fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
+    if !system_backdrop_supported() {
         return;
     }
 
