@@ -291,11 +291,28 @@ impl WgpuContext {
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
+            flags: Self::instance_flags(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: Some(display),
         })
+    }
+
+    /// Under WSL the host GPU is reachable only through Mesa's dzn driver, which
+    /// translates Vulkan to D3D12 and reports no conformance version. wgpu hides
+    /// such adapters, leaving llvmpipe as the only candidate and every frame on
+    /// the CPU. Opt in there so the real GPU stays visible.
+    ///
+    /// `/dev/dxg` is the WSL GPU device node, so this cannot fire on a native
+    /// Linux system, and a conformant driver is unaffected either way: the flag
+    /// only gates adapters whose reported conformance version is zero.
+    #[cfg(not(target_family = "wasm"))]
+    fn instance_flags() -> wgpu::InstanceFlags {
+        let mut flags = wgpu::InstanceFlags::default();
+        if cfg!(target_os = "linux") && std::path::Path::new("/dev/dxg").exists() {
+            flags |= wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+        }
+        flags
     }
 
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
