@@ -23,6 +23,7 @@ use wayland_protocols::xdg::shell::client::xdg_positioner;
 use wayland_protocols::xdg::shell::client::xdg_surface;
 use wayland_protocols::xdg::shell::client::xdg_toplevel::{self};
 use wayland_protocols::{
+    ext::background_effect::v1::client::ext_background_effect_surface_v1,
     wp::fractional_scale::v1::client::wp_fractional_scale_v1,
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
@@ -32,11 +33,12 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload, GpuSpecs,
-    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WgpuDeviceContext, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
+    AnyWindowHandle, Bounds, Capslock, Corners, Decorations, DevicePixels, ExternalDragPayload,
+    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, Scene, Size, Tiling, WgpuDeviceContext, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -103,6 +105,8 @@ pub struct WaylandWindowState {
     pub surface: wl_surface::WlSurface,
     app_id: Option<String>,
     appearance: WindowAppearance,
+    background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+    background_effect_region: Option<BackgroundEffectRegion>,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
@@ -598,6 +602,8 @@ impl WaylandWindowState {
             children: FxHashMap::default(),
             surface,
             app_id: options.app_id,
+            background_effect: None,
+            background_effect_region: None,
             blur: None,
             viewport,
             globals,
@@ -689,7 +695,10 @@ impl Drop for WaylandWindow {
 
         state.renderer.destroy();
 
-        // Destroy blur first, this has no dependencies.
+        // Destroy background effects first, as they depend on the wl_surface.
+        if let Some(background_effect) = &state.background_effect {
+            background_effect.destroy();
+        }
         if let Some(blur) = &state.blur {
             blur.release();
         }
@@ -791,6 +800,10 @@ impl WaylandWindow {
 }
 
 impl WaylandWindowStatePtr {
+    pub(crate) fn update_background_effect(&self) {
+        update_window(self.state.borrow_mut());
+    }
+
     pub fn handle(&self) -> AnyWindowHandle {
         self.state.borrow().handle
     }
@@ -1730,6 +1743,15 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
+        let background_effect_region =
+            BackgroundEffectRegion::for_scene(scene, state.bounds.size, state.scale);
+        if state.background_effect_region.as_ref() != Some(&background_effect_region) {
+            if let Some(background_effect) = state.background_effect.as_ref() {
+                set_background_effect_region(&state, background_effect, &background_effect_region);
+            }
+            state.background_effect_region = Some(background_effect_region);
+        }
+
         state.renderer_presented = state.renderer.draw(scene);
 
         if state.renderer.needs_redraw() {
@@ -1973,22 +1995,240 @@ impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct BackgroundEffectRegion {
+    bounds: Bounds<Pixels>,
+    corner_radii: Corners<Pixels>,
+    corner_smoothing: f32,
+}
+
+impl BackgroundEffectRegion {
+    fn for_scene(scene: &Scene, surface_size: Size<Pixels>, scale: f32) -> Self {
+        let Some(mask) = scene.window_corner_mask else {
+            return Self {
+                bounds: Bounds {
+                    origin: Point::default(),
+                    size: surface_size,
+                },
+                corner_radii: Corners::default(),
+                corner_smoothing: 2.0,
+            };
+        };
+
+        let scale = scale.max(f32::EPSILON);
+        Self {
+            bounds: mask.bounds.map(|value| px(value.as_f32() / scale)),
+            corner_radii: mask.corner_radii.map(|value| px(value.as_f32() / scale)),
+            corner_smoothing: mask.corner_smoothing,
+        }
+    }
+
+    fn full_surface(surface_size: Size<Pixels>) -> Self {
+        Self {
+            bounds: Bounds {
+                origin: Point::default(),
+                size: surface_size,
+            },
+            corner_radii: Corners::default(),
+            corner_smoothing: 2.0,
+        }
+    }
+}
+
+fn background_effect_rectangles(region: &BackgroundEffectRegion) -> Vec<Bounds<i32>> {
+    let left_edge = f32::from(region.bounds.origin.x);
+    let top_edge = f32::from(region.bounds.origin.y);
+    let right_edge = left_edge + f32::from(region.bounds.size.width);
+    let bottom_edge = top_edge + f32::from(region.bounds.size.height);
+    let left = left_edge.ceil() as i32;
+    let top = top_edge.ceil() as i32;
+    let right = right_edge.floor() as i32;
+    let bottom = bottom_edge.floor() as i32;
+    if left >= right || top >= bottom {
+        return Vec::new();
+    }
+
+    let width = right_edge - left_edge;
+    let height = bottom_edge - top_edge;
+    let max_radius = width.min(height) / 2.0;
+    let radius = |radius: Pixels| f32::from(radius).clamp(0.0, max_radius);
+    let top_left = radius(region.corner_radii.top_left);
+    let top_right = radius(region.corner_radii.top_right);
+    let bottom_right = radius(region.corner_radii.bottom_right);
+    let bottom_left = radius(region.corner_radii.bottom_left);
+    let top_rows = top_left.max(top_right).ceil() as i32;
+    let bottom_rows = bottom_left.max(bottom_right).ceil() as i32;
+    let top_end = (top + top_rows).min(bottom);
+    let bottom_start = (bottom - bottom_rows).max(top_end);
+    let mut rectangles = Vec::with_capacity((top_rows + bottom_rows + 1) as usize);
+
+    for y in top..top_end {
+        let edge_distance = y as f32 + 0.5 - top_edge;
+        push_background_effect_row(
+            &mut rectangles,
+            left_edge,
+            right_edge,
+            y,
+            corner_inset(top_left, edge_distance, region.corner_smoothing, max_radius),
+            corner_inset(
+                top_right,
+                edge_distance,
+                region.corner_smoothing,
+                max_radius,
+            ),
+        );
+    }
+
+    if top_end < bottom_start {
+        push_background_effect_rectangle(
+            &mut rectangles,
+            left,
+            top_end,
+            right - left,
+            bottom_start - top_end,
+        );
+    }
+
+    for y in bottom_start..bottom {
+        let edge_distance = bottom_edge - (y as f32 + 0.5);
+        push_background_effect_row(
+            &mut rectangles,
+            left_edge,
+            right_edge,
+            y,
+            corner_inset(
+                bottom_left,
+                edge_distance,
+                region.corner_smoothing,
+                max_radius,
+            ),
+            corner_inset(
+                bottom_right,
+                edge_distance,
+                region.corner_smoothing,
+                max_radius,
+            ),
+        );
+    }
+
+    rectangles
+}
+
+fn corner_inset(radius: f32, edge_distance: f32, smoothing: f32, max_radius: f32) -> f32 {
+    if radius <= 0.0 || edge_distance >= radius {
+        return 0.0;
+    }
+
+    let smoothing = if radius >= max_radius - 0.01 {
+        2.0
+    } else {
+        smoothing.max(2.0)
+    };
+    let normalized_y = ((radius - edge_distance) / radius).clamp(0.0, 1.0);
+    let normalized_x = (1.0 - normalized_y.powf(smoothing))
+        .max(0.0)
+        .powf(smoothing.recip());
+    radius * (1.0 - normalized_x)
+}
+
+fn push_background_effect_row(
+    rectangles: &mut Vec<Bounds<i32>>,
+    left_edge: f32,
+    right_edge: f32,
+    y: i32,
+    left_inset: f32,
+    right_inset: f32,
+) {
+    let left = (left_edge + left_inset).ceil() as i32;
+    let right = (right_edge - right_inset).floor() as i32;
+    push_background_effect_rectangle(rectangles, left, y, right - left, 1);
+}
+
+fn push_background_effect_rectangle(
+    rectangles: &mut Vec<Bounds<i32>>,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    if let Some(previous) = rectangles.last_mut()
+        && previous.origin.x == x
+        && previous.size.width == width
+        && previous.origin.y + previous.size.height == y
+    {
+        previous.size.height += height;
+        return;
+    }
+
+    rectangles.push(Bounds {
+        origin: Point { x, y },
+        size: Size { width, height },
+    });
+}
+
+fn set_background_effect_region(
+    state: &WaylandWindowState,
+    background_effect: &ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1,
+    region: &BackgroundEffectRegion,
+) {
+    let wl_region = state
+        .globals
+        .compositor
+        .create_region(&state.globals.qh, ());
+    for rectangle in background_effect_rectangles(region) {
+        wl_region.add(
+            rectangle.origin.x,
+            rectangle.origin.y,
+            rectangle.size.width,
+            rectangle.size.height,
+        );
+    }
+    background_effect.set_blur_region(Some(&wl_region));
+    wl_region.destroy();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackgroundBlurProtocol {
+    Ext,
+    Kde,
+}
+
+fn background_blur_protocol(
+    has_ext_manager: bool,
+    ext_blur_supported: bool,
+    has_kde_manager: bool,
+) -> Option<BackgroundBlurProtocol> {
+    if has_ext_manager && ext_blur_supported {
+        Some(BackgroundBlurProtocol::Ext)
+    } else if has_kde_manager {
+        Some(BackgroundBlurProtocol::Kde)
+    } else {
+        None
+    }
+}
+
 fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
     state.renderer.update_transparency(!opaque);
-    let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
-    opaque_area.inset(f32::from(state.inset()) as i32);
+    let surface_area = state
+        .bounds
+        .map_origin(|_| Pixels::default())
+        .map(|v| f32::from(v) as i32);
 
     let region = state
         .globals
         .compositor
         .create_region(&state.globals.qh, ());
     region.add(
-        opaque_area.origin.x,
-        opaque_area.origin.y,
-        opaque_area.size.width,
-        opaque_area.size.height,
+        surface_area.origin.x,
+        surface_area.origin.y,
+        surface_area.size.width,
+        surface_area.size.height,
     );
 
     // Note that rounded corners make this rectangle API hard to work with.
@@ -2004,23 +2244,82 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
-    if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
+    let background_effect_manager = state.globals.background_effect_manager.clone();
+    let blur_manager = state.globals.blur_manager.clone();
+    let protocol = background_blur_protocol(
+        background_effect_manager.is_some(),
+        state.globals.background_effect_blur_supported.get(),
+        blur_manager.is_some(),
+    );
+    let wants_blur = state.background_appearance == WindowBackgroundAppearance::Blurred;
+    let mut commit_surface = false;
+
+    match (wants_blur, protocol) {
+        (true, Some(BackgroundBlurProtocol::Ext)) => {
+            if state.blur.is_some() {
+                if let Some(blur_manager) = &blur_manager {
+                    blur_manager.unset(&state.surface);
+                }
+                if let Some(blur) = state.blur.take() {
+                    blur.release();
+                }
+            }
+
+            if state.background_effect.is_none() {
+                let background_effect = background_effect_manager
+                    .as_ref()
+                    .unwrap()
+                    .get_background_effect(&state.surface, &state.globals.qh, ());
+                state.background_effect = Some(background_effect);
+            }
+            let background_effect_region = state
+                .background_effect_region
+                .clone()
+                .unwrap_or_else(|| BackgroundEffectRegion::full_surface(state.bounds.size));
+            set_background_effect_region(
+                &state,
+                state.background_effect.as_ref().unwrap(),
+                &background_effect_region,
+            );
+            commit_surface = true;
+        }
+        (true, Some(BackgroundBlurProtocol::Kde)) => {
+            if let Some(background_effect) = state.background_effect.take() {
+                background_effect.destroy();
+                commit_surface = true;
+            }
+
             if state.blur.is_none() {
-                let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
+                let blur =
+                    blur_manager
+                        .as_ref()
+                        .unwrap()
+                        .create(&state.surface, &state.globals.qh, ());
                 state.blur = Some(blur);
             }
             state.blur.as_ref().unwrap().commit();
-        } else {
-            // It probably doesn't hurt to clear the blur for opaque windows
-            blur_manager.unset(&state.surface);
-            if let Some(b) = state.blur.take() {
-                b.release()
+        }
+        _ => {
+            if let Some(background_effect) = state.background_effect.take() {
+                background_effect.destroy();
+                commit_surface = true;
+            }
+
+            if let Some(blur_manager) = &blur_manager {
+                // It probably doesn't hurt to clear the blur for opaque windows.
+                blur_manager.unset(&state.surface);
+            }
+            if let Some(blur) = state.blur.take() {
+                blur.release();
             }
         }
     }
 
     region.destroy();
+    if commit_surface {
+        // ext-background-effect state is double-buffered with the wl_surface.
+        state.surface.commit();
+    }
 }
 
 pub(crate) trait WindowDecorationsExt {
@@ -2098,4 +2397,92 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Bounds, Corners, Point, Size, point, px, size};
+
+    use super::{
+        BackgroundBlurProtocol, BackgroundEffectRegion, background_blur_protocol,
+        background_effect_rectangles,
+    };
+
+    #[test]
+    fn prefers_ext_background_effect_and_falls_back_to_kde_blur() {
+        assert_eq!(
+            background_blur_protocol(true, true, true),
+            Some(BackgroundBlurProtocol::Ext)
+        );
+        assert_eq!(
+            background_blur_protocol(true, false, true),
+            Some(BackgroundBlurProtocol::Kde)
+        );
+        assert_eq!(background_blur_protocol(true, false, false), None);
+    }
+
+    #[test]
+    fn full_background_effect_region_covers_the_surface_once() {
+        assert_eq!(
+            background_effect_rectangles(&BackgroundEffectRegion::full_surface(size(
+                px(100.0),
+                px(60.0),
+            ))),
+            [Bounds {
+                origin: Point { x: 0, y: 0 },
+                size: Size {
+                    width: 100,
+                    height: 60,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn rounded_background_effect_region_stays_inside_the_window_mask() {
+        let mask = BackgroundEffectRegion {
+            bounds: Bounds {
+                origin: point(px(8.0), px(6.0)),
+                size: size(px(100.0), px(60.0)),
+            },
+            corner_radii: Corners::all(px(14.0)),
+            corner_smoothing: 4.0,
+        };
+        let rectangles = background_effect_rectangles(&mask);
+        let first = rectangles.first().unwrap();
+        let last = rectangles.last().unwrap();
+
+        assert_eq!(first.origin.y, 6);
+        assert!(first.origin.x > 8);
+        assert!(first.size.width < 100);
+        assert_eq!(last.origin.y + last.size.height, 66);
+        assert_eq!(last.origin.x, first.origin.x);
+        assert_eq!(last.size.width, first.size.width);
+        assert!(rectangles.iter().all(|rectangle| {
+            rectangle.origin.x >= 8
+                && rectangle.origin.y >= 6
+                && rectangle.origin.x + rectangle.size.width <= 108
+                && rectangle.origin.y + rectangle.size.height <= 66
+        }));
+        assert!(rectangles.iter().any(|rectangle| {
+            rectangle.origin.x == 8 && rectangle.size.width == 100 && rectangle.size.height > 1
+        }));
+    }
+
+    #[test]
+    fn squircle_blur_region_tracks_the_window_masks_fuller_corner() {
+        let region = |corner_smoothing| BackgroundEffectRegion {
+            bounds: Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(100.0), px(60.0)),
+            },
+            corner_radii: Corners::all(px(14.0)),
+            corner_smoothing,
+        };
+        let circular = background_effect_rectangles(&region(2.0));
+        let squircle = background_effect_rectangles(&region(4.0));
+
+        assert!(squircle[0].origin.x < circular[0].origin.x);
+        assert!(squircle[0].size.width > circular[0].size.width);
+    }
 }
