@@ -2005,21 +2005,54 @@ struct BackgroundEffectRegion {
 impl BackgroundEffectRegion {
     fn for_scene(scene: &Scene, surface_size: Size<Pixels>, scale: f32) -> Self {
         let Some(mask) = scene.window_corner_mask else {
-            return Self {
-                bounds: Bounds {
-                    origin: Point::default(),
-                    size: surface_size,
-                },
-                corner_radii: Corners::default(),
-                corner_smoothing: 2.0,
-            };
+            return Self::full_surface(surface_size);
         };
 
         let scale = scale.max(f32::EPSILON);
+        Self::from_window_mask(
+            mask.bounds.map(|value| px(value.as_f32() / scale)),
+            mask.corner_radii.map(|value| px(value.as_f32() / scale)),
+            mask.corner_smoothing,
+            surface_size,
+        )
+    }
+
+    fn from_window_mask(
+        mask_bounds: Bounds<Pixels>,
+        mask_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        surface_size: Size<Pixels>,
+    ) -> Self {
+        // GPUI places the scene mask on the visible CSD frame and leaves its
+        // drop shadow outside. Extend the compositor effect through that
+        // shadow while preserving a concentric curve at each exposed corner.
+        let left_inset = mask_bounds.origin.x.max(px(0.0));
+        let top_inset = mask_bounds.origin.y.max(px(0.0));
+        let right_inset =
+            (surface_size.width - mask_bounds.origin.x - mask_bounds.size.width).max(px(0.0));
+        let bottom_inset =
+            (surface_size.height - mask_bounds.origin.y - mask_bounds.size.height).max(px(0.0));
+
+        let outset_radius = |radius: Pixels, first_inset: Pixels, second_inset: Pixels| {
+            if radius > px(0.0) {
+                radius + first_inset.min(second_inset)
+            } else {
+                radius
+            }
+        };
+
         Self {
-            bounds: mask.bounds.map(|value| px(value.as_f32() / scale)),
-            corner_radii: mask.corner_radii.map(|value| px(value.as_f32() / scale)),
-            corner_smoothing: mask.corner_smoothing,
+            bounds: Bounds {
+                origin: Point::default(),
+                size: surface_size,
+            },
+            corner_radii: Corners {
+                top_left: outset_radius(mask_radii.top_left, left_inset, top_inset),
+                top_right: outset_radius(mask_radii.top_right, right_inset, top_inset),
+                bottom_right: outset_radius(mask_radii.bottom_right, right_inset, bottom_inset),
+                bottom_left: outset_radius(mask_radii.bottom_left, left_inset, bottom_inset),
+            },
+            corner_smoothing,
         }
     }
 
@@ -2439,34 +2472,91 @@ mod tests {
     }
 
     #[test]
-    fn rounded_background_effect_region_stays_inside_the_window_mask() {
-        let mask = BackgroundEffectRegion {
-            bounds: Bounds {
-                origin: point(px(8.0), px(6.0)),
+    fn rounded_background_effect_region_outsets_the_window_mask_through_its_shadow() {
+        let region = BackgroundEffectRegion::from_window_mask(
+            Bounds {
+                origin: point(px(12.0), px(12.0)),
                 size: size(px(100.0), px(60.0)),
             },
-            corner_radii: Corners::all(px(14.0)),
-            corner_smoothing: 4.0,
-        };
-        let rectangles = background_effect_rectangles(&mask);
+            Corners::all(px(14.0)),
+            4.0,
+            size(px(124.0), px(84.0)),
+        );
+        let rectangles = background_effect_rectangles(&region);
         let first = rectangles.first().unwrap();
         let last = rectangles.last().unwrap();
 
-        assert_eq!(first.origin.y, 6);
-        assert!(first.origin.x > 8);
-        assert!(first.size.width < 100);
-        assert_eq!(last.origin.y + last.size.height, 66);
+        assert_eq!(region.bounds.origin, point(px(0.0), px(0.0)));
+        assert_eq!(region.bounds.size, size(px(124.0), px(84.0)));
+        assert_eq!(region.corner_radii, Corners::all(px(26.0)));
+        assert_eq!(first.origin.y, 0);
+        assert!(first.origin.x > 0);
+        assert!(first.size.width < 124);
+        assert_eq!(last.origin.y + last.size.height, 84);
         assert_eq!(last.origin.x, first.origin.x);
         assert_eq!(last.size.width, first.size.width);
         assert!(rectangles.iter().all(|rectangle| {
-            rectangle.origin.x >= 8
-                && rectangle.origin.y >= 6
-                && rectangle.origin.x + rectangle.size.width <= 108
-                && rectangle.origin.y + rectangle.size.height <= 66
+            rectangle.origin.x >= 0
+                && rectangle.origin.y >= 0
+                && rectangle.origin.x + rectangle.size.width <= 124
+                && rectangle.origin.y + rectangle.size.height <= 84
         }));
         assert!(rectangles.iter().any(|rectangle| {
-            rectangle.origin.x == 8 && rectangle.size.width == 100 && rectangle.size.height > 1
+            rectangle.origin.x == 0 && rectangle.size.width == 124 && rectangle.size.height > 1
         }));
+    }
+
+    #[test]
+    fn square_window_mask_keeps_a_square_outer_blur_region() {
+        let region = BackgroundEffectRegion::from_window_mask(
+            Bounds {
+                origin: point(px(12.0), px(12.0)),
+                size: size(px(100.0), px(60.0)),
+            },
+            Corners::default(),
+            4.0,
+            size(px(124.0), px(84.0)),
+        );
+
+        assert_eq!(region.corner_radii, Corners::default());
+        assert_eq!(
+            background_effect_rectangles(&region),
+            [Bounds {
+                origin: Point { x: 0, y: 0 },
+                size: Size {
+                    width: 124,
+                    height: 84,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn partially_tiled_window_outsets_only_its_exposed_corners() {
+        let region = BackgroundEffectRegion::from_window_mask(
+            Bounds {
+                origin: point(px(0.0), px(12.0)),
+                size: size(px(112.0), px(60.0)),
+            },
+            Corners {
+                top_left: px(0.0),
+                top_right: px(14.0),
+                bottom_right: px(14.0),
+                bottom_left: px(0.0),
+            },
+            4.0,
+            size(px(124.0), px(84.0)),
+        );
+
+        assert_eq!(
+            region.corner_radii,
+            Corners {
+                top_left: px(0.0),
+                top_right: px(26.0),
+                bottom_right: px(26.0),
+                bottom_left: px(0.0),
+            }
+        );
     }
 
     #[test]
