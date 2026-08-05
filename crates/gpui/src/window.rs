@@ -2507,6 +2507,7 @@ impl Window {
         keystroke: &Keystroke,
         action: Option<&dyn Action>,
         context_stack: Vec<KeyContext>,
+        is_held: bool,
         cx: &mut App,
     ) {
         cx.keystroke_observers.clone().retain(&(), move |callback| {
@@ -2515,6 +2516,7 @@ impl Window {
                     keystroke: keystroke.clone(),
                     action: action.map(|action| action.boxed_clone()),
                     context_stack: context_stack.clone(),
+                    is_held,
                 },
                 self,
                 cx,
@@ -2526,6 +2528,7 @@ impl Window {
         &mut self,
         keystroke: &Keystroke,
         context_stack: Vec<KeyContext>,
+        is_held: bool,
         cx: &mut App,
     ) {
         cx.keystroke_interceptors
@@ -2536,6 +2539,7 @@ impl Window {
                         keystroke: keystroke.clone(),
                         action: None,
                         context_stack: context_stack.clone(),
+                        is_held,
                     },
                     self,
                     cx,
@@ -6239,8 +6243,11 @@ impl Window {
             return;
         };
 
+        let is_held = event
+            .downcast_ref::<KeyDownEvent>()
+            .is_some_and(|event| event.is_held);
         cx.propagate_event = true;
-        self.dispatch_keystroke_interceptors(&keystroke, self.context_stack(), cx);
+        self.dispatch_keystroke_interceptors(&keystroke, self.context_stack(), is_held, cx);
         if !cx.propagate_event {
             self.finish_dispatch_key_event(
                 event,
@@ -6330,6 +6337,7 @@ impl Window {
                         &keystroke,
                         Some(binding.action.as_ref()),
                         match_result.context_stack,
+                        is_held,
                         cx,
                     );
                     self.pending_input_changed(cx);
@@ -6405,7 +6413,10 @@ impl Window {
         }
 
         if let Some(keystroke) = recognized_keystroke {
-            self.dispatch_keystroke_observers(keystroke, None, context_stack, cx);
+            let is_held = event
+                .downcast_ref::<KeyDownEvent>()
+                .is_some_and(|event| event.is_held);
+            self.dispatch_keystroke_observers(keystroke, None, context_stack, is_held, cx);
         }
     }
 
@@ -6611,6 +6622,7 @@ impl Window {
                         &replay.keystroke,
                         Some(binding.action.as_ref()),
                         Vec::default(),
+                        false,
                         cx,
                     );
                     continue 'replay;
