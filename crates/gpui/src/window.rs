@@ -4890,6 +4890,8 @@ impl Window {
             bounds,
             content_mask,
             corner_radii: Default::default(),
+            corner_smoothing: self.default_corner_smoothing,
+            pad2: 0,
             tile,
         });
     }
@@ -4981,6 +4983,8 @@ impl Window {
                 bounds,
                 corner_radii: Default::default(),
                 content_mask,
+                corner_smoothing: self.default_corner_smoothing,
+                pad2: 0,
                 tile,
                 opacity,
             });
@@ -5153,6 +5157,8 @@ impl Window {
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,
+            corner_smoothing: self.default_corner_smoothing,
+            pad2: 0,
             tile: sub_tile,
             opacity,
         });
@@ -5180,6 +5186,7 @@ impl Window {
             bounds,
             content_mask,
             corner_radii: corner_radii.scale(self.scale_factor()),
+            corner_smoothing: self.default_corner_smoothing,
             image_buffer,
         });
     }
