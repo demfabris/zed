@@ -5295,6 +5295,7 @@ impl Window {
     pub(crate) fn paint_external_texture(
         &mut self,
         bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
         view: wgpu::TextureView,
     ) {
         use crate::PaintSurface;
@@ -5307,6 +5308,8 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            corner_radii: corner_radii.scale(self.scale_factor()),
+            corner_smoothing: self.default_corner_smoothing,
             texture_view: view,
         });
     }
@@ -5318,6 +5321,7 @@ impl Window {
     pub(crate) fn paint_external_texture(
         &mut self,
         bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
         texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     ) {
         use crate::PaintSurface;
@@ -5330,6 +5334,8 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            corner_radii: corner_radii.scale(self.scale_factor()),
+            corner_smoothing: self.default_corner_smoothing,
             texture,
         });
     }

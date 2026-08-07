@@ -813,12 +813,10 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
     pub corner_radii: Corners<ScaledPixels>,
     /// Superellipse exponent for the rounded corners, as on [`Quad`]. A surface
     /// fills a pane whose frame is drawn with quads, so it is cut with their
     /// curve rather than a plain arc.
-    #[cfg(target_os = "macos")]
     pub corner_smoothing: f32,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
