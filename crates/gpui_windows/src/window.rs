@@ -925,6 +925,18 @@ impl PlatformWindow for WindowsWindow {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }
 
+    fn set_visible(&self, visible: bool) {
+        // SW_SHOWNA rather than SW_SHOW: it keeps the placement the hide left
+        // behind (a maximized window comes back maximized) and takes no focus,
+        // which stays `activate`'s job.
+        let command = if visible { SW_SHOWNA } else { SW_HIDE };
+        unsafe { ShowWindowAsync(self.0.hwnd, command).ok().log_err() };
+    }
+
+    fn is_visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.0.hwnd).as_bool() }
+    }
+
     fn zoom(&self) {
         unsafe {
             if IsWindowVisible(self.0.hwnd).as_bool() {

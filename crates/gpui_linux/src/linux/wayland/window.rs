@@ -1649,6 +1649,16 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn set_visible(&self, visible: bool) {
+        // An xdg toplevel cannot unmap and come back without repeating its
+        // initial configure, so hiding degrades to minimizing here. Showing is
+        // then nothing: the default `is_visible` keeps reporting true, and
+        // `activate` is what asks the compositor to bring the window back.
+        if !visible {
+            self.minimize();
+        }
+    }
+
     fn zoom(&self) {
         let state = self.borrow();
         if let Some(toplevel) = state.surface_state.toplevel() {

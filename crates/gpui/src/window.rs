@@ -6004,6 +6004,20 @@ impl Window {
         self.platform_window.minimize();
     }
 
+    /// Take the current window off screen without closing it, or put it back.
+    /// Showing does not focus the window; pair it with `activate_window`.
+    ///
+    /// See [`PlatformWindow::set_visible`] for what each platform does.
+    pub fn set_window_visible(&self, visible: bool) {
+        self.platform_window.set_visible(visible);
+    }
+
+    /// Whether the current window is on screen at all. A minimized window is
+    /// still visible in this sense; one hidden by `set_window_visible` is not.
+    pub fn is_window_visible(&self) -> bool {
+        self.platform_window.is_visible()
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();

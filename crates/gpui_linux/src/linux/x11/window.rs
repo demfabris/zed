@@ -277,6 +277,10 @@ pub struct X11WindowState {
     maximized_vertical: bool,
     maximized_horizontal: bool,
     hidden: bool,
+    /// Whether the client wants the window mapped. `hidden` above is the WM's
+    /// minimized state; this is ours, and a withdrawn window carries no
+    /// `_NET_WM_STATE` to read it back from.
+    mapped: bool,
     active: bool,
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
@@ -801,6 +805,7 @@ impl X11WindowState {
                 maximized_vertical: false,
                 maximized_horizontal: false,
                 hidden: false,
+                mapped: true,
                 appearance,
                 handle,
                 background_appearance: WindowBackgroundAppearance::Opaque,
@@ -1630,6 +1635,36 @@ impl PlatformWindow for X11Window {
             ),
         )
         .log_err();
+    }
+
+    fn set_visible(&self, visible: bool) {
+        {
+            let mut state = self.0.state.borrow_mut();
+            if state.mapped == visible {
+                return;
+            }
+            state.mapped = visible;
+        }
+        // Unmapping withdraws the window; the WM re-runs its normal map flow
+        // on the way back, which is exactly the ICCCM way to hide without
+        // closing. The client pauses the refresh loop on UnmapNotify.
+        if visible {
+            check_reply(
+                || "X11 MapWindow failed.",
+                self.0.xcb.map_window(self.0.x_window),
+            )
+            .log_err();
+        } else {
+            check_reply(
+                || "X11 UnmapWindow failed.",
+                self.0.xcb.unmap_window(self.0.x_window),
+            )
+            .log_err();
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.0.state.borrow().mapped
     }
 
     fn zoom(&self) {

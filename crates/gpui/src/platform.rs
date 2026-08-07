@@ -862,6 +862,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     fn minimize(&self);
+    /// Take the window off screen without closing it, or put it back.
+    ///
+    /// Windows hides the native window and X11 unmaps it. Wayland cannot
+    /// unmap an xdg toplevel and bring it back without repeating the initial
+    /// configure, so it minimizes instead and reports itself still visible;
+    /// macOS hides at the application level, so both defaults stand there.
+    fn set_visible(&self, _visible: bool) {}
+    /// Whether the window is on screen at all. `false` only ever follows a
+    /// `set_visible(false)` on a platform that implements it; a minimized
+    /// window is still visible in this sense.
+    fn is_visible(&self) -> bool {
+        true
+    }
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;
