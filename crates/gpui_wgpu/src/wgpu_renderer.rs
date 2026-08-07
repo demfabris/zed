@@ -92,6 +92,11 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    // WGSL field order: top_left, top_right, bottom_right, bottom_left.
+    corner_radii: [f32; 4],
+    corner_smoothing: f32,
+    // The WGSL struct rounds up to its 8-byte alignment.
+    pad: f32,
 }
 
 #[repr(C)]
@@ -1601,6 +1606,14 @@ impl WgpuRenderer {
             let params = SurfaceParams {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
+                corner_radii: [
+                    surface.corner_radii.top_left.0,
+                    surface.corner_radii.top_right.0,
+                    surface.corner_radii.bottom_right.0,
+                    surface.corner_radii.bottom_left.0,
+                ],
+                corner_smoothing: surface.corner_smoothing,
+                pad: 0.0,
             };
             let instances =
                 self.write_instance_binding("surfaces_bind_group", instance_offset, &[params])?;

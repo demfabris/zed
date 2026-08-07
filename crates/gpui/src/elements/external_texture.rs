@@ -107,8 +107,14 @@ impl Element for ExternalTexture {
         window: &mut Window,
         _: &mut App,
     ) {
+        let mut style = Style::default();
+        style.refine(&self.style);
+        // The pane's rounded corners arrive as ordinary `.rounded_*` styling;
+        // resolve them here so the surface pipeline can cut the texture with
+        // the same curve quads use, instead of overflowing the pane's frame.
+        let corner_radii = style.corner_radii.to_pixels(window.rem_size());
         let bounds = self.object_fit.get_bounds(bounds, self.size);
-        window.paint_external_texture(bounds, self.handle.clone());
+        window.paint_external_texture(bounds, corner_radii, self.handle.clone());
     }
 }
 

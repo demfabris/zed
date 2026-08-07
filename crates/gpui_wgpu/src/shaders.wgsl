@@ -1382,6 +1382,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    corner_radii: Corners,
+    corner_smoothing: f32,
 }
 
 struct SurfaceVarying {
@@ -1414,7 +1416,13 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     // rejects the whole shader module, which takes every pipeline in it down.
     // Surface textures have no mips, so level 0 is what sampling meant anyway.
     let sample = textureSampleLevel(t_sprite, s_sprite, input.texture_position, 0.0);
-    let mask = window_mask_alpha(input.position.xy);
+    // Cut the texture with the same superellipse the pane's quads draw, as
+    // surface_fragment does on Metal; the content mask is rectangular, so
+    // without this a surface in a rounded pane overflows the frame's corners.
+    let coverage = saturate(0.5 - quad_sdf_smooth(
+        input.position.xy, surface_locals.bounds,
+        surface_locals.corner_radii, surface_locals.corner_smoothing));
+    let mask = window_mask_alpha(input.position.xy) * coverage;
     if (globals.premultiplied_alpha != 0u) {
         return sample * mask;
     }
