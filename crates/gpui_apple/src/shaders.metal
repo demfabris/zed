@@ -733,8 +733,8 @@ fragment float4 polychrome_sprite_fragment(
                                           min_filter::linear);
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
-  float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+  float distance = quad_sdf_smooth(input.position.xy, sprite.bounds,
+                                   sprite.corner_radii, sprite.corner_smoothing);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -919,7 +919,8 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
 
   SurfaceBounds surface = surfaces[input.surface_id];
   float coverage = saturate(
-      0.5 - quad_sdf(input.position.xy, surface.bounds, surface.corner_radii));
+      0.5 - quad_sdf_smooth(input.position.xy, surface.bounds,
+                            surface.corner_radii, surface.corner_smoothing));
   float4 color = ycbcrToRGBTransform * ycbcr;
   color.a *= coverage;
   return color;
@@ -934,7 +935,8 @@ fragment float4 surface_bgra_fragment(
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   SurfaceBounds surface = surfaces[input.surface_id];
   float coverage = saturate(
-      0.5 - quad_sdf(input.position.xy, surface.bounds, surface.corner_radii));
+      0.5 - quad_sdf_smooth(input.position.xy, surface.bounds,
+                            surface.corner_radii, surface.corner_smoothing));
   return bgra_texture.sample(texture_sampler, input.texture_position) * coverage;
 }
 

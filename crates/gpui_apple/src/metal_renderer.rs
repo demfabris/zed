@@ -1442,6 +1442,7 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
             bounds: surface.bounds,
             content_mask: surface.content_mask,
             corner_radii: surface.corner_radii,
+            corner_smoothing: surface.corner_smoothing,
         }))?,
     })
 }
@@ -1629,12 +1630,13 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: gpui::Corners<ScaledPixels>,
+    pub corner_smoothing: f32,
 }
 
 #[cfg(any(test, feature = "test-support"))]

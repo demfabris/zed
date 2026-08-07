@@ -1331,6 +1331,8 @@ struct PolychromeSprite {
     bounds: Bounds,
     content_mask: Bounds,
     corner_radii: Corners,
+    corner_smoothing: f32,
+    pad2: u32, // align to 8 bytes
     tile: AtlasTile,
 }
 
@@ -1364,7 +1366,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     }
 
     let sprite = load_poly_sprite(input.sprite_id);
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let distance = quad_sdf_smooth(input.position.xy, sprite.bounds, sprite.corner_radii, sprite.corner_smoothing);
 
     var color = sample;
     if (sprite.grayscale != 0u) {

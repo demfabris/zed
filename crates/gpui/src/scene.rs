@@ -788,8 +788,18 @@ pub struct PolychromeSprite {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    /// Superellipse exponent for the rounded corners: `2.0` is a circular
+    /// arc, `4.0` is a squircle (continuous corner). An image inside a rounded
+    /// frame has to be cut with the same curve the frame is drawn with, or the
+    /// two edges part company along the diagonal.
+    pub corner_smoothing: f32,
+    /// Padding for alignment for repr(C) layout.
+    pub(crate) pad2: u32,
     pub tile: AtlasTile,
 }
+
+// Same 8-byte shader stride `Quad` is padded to, for the same reason.
+const _: () = assert!(size_of::<PolychromeSprite>() % 8 == 0);
 
 impl From<PolychromeSprite> for Primitive {
     fn from(sprite: PolychromeSprite) -> Self {
@@ -805,6 +815,11 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub corner_radii: Corners<ScaledPixels>,
+    /// Superellipse exponent for the rounded corners, as on [`Quad`]. A surface
+    /// fills a pane whose frame is drawn with quads, so it is cut with their
+    /// curve rather than a plain arc.
+    #[cfg(target_os = "macos")]
+    pub corner_smoothing: f32,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
