@@ -112,6 +112,46 @@ fn zoomed_platform_metrics(platform_window: &dyn PlatformWindow, zoom: f32) -> (
     )
 }
 
+/// Converts a persistent window mask from platform-window edge coordinates into
+/// the logical viewport used by the current content zoom, then snaps it exactly
+/// like painted quads. A client-side frame describes its far edges relative to
+/// the real platform surface, while the element tree lays out against
+/// `viewport_size`; preserving the four edge insets keeps those two spaces from
+/// diverging when zoom changes.
+fn window_corner_mask_for_viewport(
+    mask: (Bounds<Pixels>, Corners<Pixels>),
+    platform_size: Size<Pixels>,
+    viewport_size: Size<Pixels>,
+    scale_factor: f32,
+    corner_smoothing: f32,
+) -> WindowCornerMask {
+    let (bounds, corner_radii) = mask;
+    let zero = px(0.0);
+    let viewport_width = viewport_size.width.max(zero);
+    let viewport_height = viewport_size.height.max(zero);
+    let left = bounds.left().max(zero).min(viewport_width);
+    let top = bounds.top().max(zero).min(viewport_height);
+    let right_inset = (platform_size.width - bounds.right()).max(zero);
+    let bottom_inset = (platform_size.height - bounds.bottom()).max(zero);
+    let right = (viewport_width - right_inset).max(left).min(viewport_width);
+    let bottom = (viewport_height - bottom_inset)
+        .max(top)
+        .min(viewport_height);
+    let left = round_to_device_pixel(left.0, scale_factor);
+    let top = round_to_device_pixel(top.0, scale_factor);
+    let right = round_to_device_pixel(right.0, scale_factor).max(left);
+    let bottom = round_to_device_pixel(bottom.0, scale_factor).max(top);
+
+    WindowCornerMask {
+        bounds: Bounds::from_corners(
+            point(ScaledPixels(left), ScaledPixels(top)),
+            point(ScaledPixels(right), ScaledPixels(bottom)),
+        ),
+        corner_radii: corner_radii.scale(scale_factor),
+        corner_smoothing,
+    }
+}
+
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -2557,7 +2597,9 @@ impl Window {
     /// Clips everything this window draws, except drop shadows, to the given rounded
     /// rectangle. Client-side-decorated windows use this to keep square-edged content
     /// (scrollbars, embedded surfaces) from escaping their rounded frame; drop shadows
-    /// are exempt because the frame's own shadow lives outside the mask. The mask
+    /// are exempt because the frame's own shadow lives outside the mask. Bounds describe
+    /// the real platform drawable: when content zoom changes the logical viewport, GPUI
+    /// preserves their four edge insets and scales the radii with the content. The mask
     /// persists across frames until changed; pass `None` to disable.
     pub fn set_window_corner_mask(&mut self, mask: Option<(Bounds<Pixels>, Corners<Pixels>)>) {
         if self.window_corner_mask != mask {
@@ -2707,6 +2749,12 @@ impl Window {
         }
 
         self.zoom = zoom;
+        if let Some(inset) = self.client_inset {
+            // The inset is stored in unzoomed logical pixels, but xdg window
+            // geometry is expressed in real surface coordinates. Keep the
+            // compositor's CSD origin in step with the newly scaled frame.
+            self.platform_window.set_client_inset(inset * zoom);
+        }
         self.sync_platform_metrics();
         self.refresh();
     }
@@ -3010,13 +3058,15 @@ impl Window {
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
         let scale_factor = self.scale_factor();
-        self.rendered_frame.scene.window_corner_mask =
-            self.window_corner_mask
-                .map(|(bounds, corner_radii)| WindowCornerMask {
-                    bounds: bounds.scale(scale_factor),
-                    corner_radii: corner_radii.scale(scale_factor),
-                    corner_smoothing: self.default_corner_smoothing,
-                });
+        self.rendered_frame.scene.window_corner_mask = self.window_corner_mask.map(|mask| {
+            window_corner_mask_for_viewport(
+                mask,
+                self.platform_window.content_size(),
+                self.viewport_size(),
+                scale_factor,
+                self.default_corner_smoothing,
+            )
+        });
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -7195,14 +7245,16 @@ mod tests {
     };
 
     use crate::{
-        AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
+        AnyWindowHandle, AppContext as _, Bounds, Context, Corners, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, MAX_WINDOW_ZOOM, MIN_WINDOW_ZOOM,
         Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels, Point,
-        Render, RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext,
-        VisualTestContext, Window,
-        WindowAppearance, WindowOptions, canvas, div, point, px, size,
+        Render, RequestFrameOptions, ScaledPixels, StatefulInteractiveElement as _, Styled,
+        TestAppContext, VisualTestContext, Window, WindowAppearance, WindowOptions, canvas, div,
+        point, px, size,
     };
+
+    use super::window_corner_mask_for_viewport;
 
     struct EmptyView;
 
@@ -7979,6 +8031,57 @@ mod tests {
     struct ZoomView {
         child_bounds: Rc<Cell<Bounds<Pixels>>>,
         mouse_downs: Rc<RefCell<Vec<Point<Pixels>>>>,
+    }
+
+    #[test]
+    fn window_corner_mask_preserves_edge_insets_across_zoom_and_output_scale() {
+        let platform_size = size(px(800.0), px(600.0));
+        let inset = px(12.0);
+        let input = (
+            Bounds {
+                origin: point(inset, inset),
+                size: size(
+                    platform_size.width - inset * 2.0,
+                    platform_size.height - inset * 2.0,
+                ),
+            },
+            Corners::all(px(14.0)),
+        );
+
+        for output_scale in [1.0, 1.25, 2.0] {
+            for zoom in [0.8, 1.0, 1.5, 2.0] {
+                let viewport_size = platform_size.map(|length| length / zoom);
+                let effective_scale = output_scale * zoom;
+                let mask = window_corner_mask_for_viewport(
+                    input,
+                    platform_size,
+                    viewport_size,
+                    effective_scale,
+                    4.0,
+                );
+                let expected_left = super::round_to_device_pixel(inset.0, effective_scale);
+                let expected_top = expected_left;
+                let expected_right =
+                    super::round_to_device_pixel((viewport_size.width - inset).0, effective_scale);
+                let expected_bottom =
+                    super::round_to_device_pixel((viewport_size.height - inset).0, effective_scale);
+
+                assert_eq!(
+                    mask.bounds,
+                    Bounds::from_corners(
+                        point(ScaledPixels(expected_left), ScaledPixels(expected_top)),
+                        point(ScaledPixels(expected_right), ScaledPixels(expected_bottom)),
+                    ),
+                    "output_scale={output_scale}, zoom={zoom}",
+                );
+                assert_eq!(
+                    mask.corner_radii,
+                    Corners::all(px(14.0)).scale(effective_scale),
+                    "output_scale={output_scale}, zoom={zoom}",
+                );
+                assert_eq!(mask.corner_smoothing, 4.0);
+            }
+        }
     }
 
     impl Render for ZoomView {

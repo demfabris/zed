@@ -3,7 +3,7 @@ use std::{
     ffi::c_void,
     ptr::NonNull,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use collections::{FxHashMap, HashMap};
@@ -40,6 +40,7 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
     WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
+    point,
     popup::PopupOptions,
     px, size,
 };
@@ -1753,8 +1754,26 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
-        let background_effect_region =
-            BackgroundEffectRegion::for_scene(scene, state.bounds.size, state.scale);
+        // ext-background-effect defines its region in wl_surface coordinates.
+        // KWin 6.7 instead anchors it at the xdg window geometry (the client
+        // content rect), shifting a CSD region down and right by its exposed
+        // top/left inset. Submit the inverse translation on KWin so the effect
+        // and the rendered mask meet at the same pixels.
+        let compositor_offset = if kwin_uses_content_local_background_effect_coordinates() {
+            let inset = state.inset();
+            point(
+                if state.tiling.left { px(0.0) } else { inset },
+                if state.tiling.top { px(0.0) } else { inset },
+            )
+        } else {
+            Point::default()
+        };
+        let background_effect_region = BackgroundEffectRegion::for_scene(
+            scene,
+            state.bounds.size,
+            state.renderer.viewport_size(),
+            compositor_offset,
+        );
         if state.background_effect_region.as_ref() != Some(&background_effect_region) {
             if let Some(background_effect) = state.background_effect.as_ref() {
                 set_background_effect_region(&state, background_effect, &background_effect_region);
@@ -1762,6 +1781,13 @@ impl PlatformWindow for WaylandWindow {
             state.background_effect_region = Some(background_effect_region);
         }
 
+        // A compositor effect applies independently of buffer alpha. Extending
+        // it into a translucent client-side shadow therefore reveals either a
+        // raw rail or a blurred corner wedge. Keep the exact rounded effect and
+        // make the unused CSD margin fully transparent while ext blur is active.
+        let clip_window_shadows =
+            state.background_effect.is_some() && scene.window_corner_mask.is_some();
+        state.renderer.set_clip_window_shadows(clip_window_shadows);
         state.renderer_presented = state.renderer.draw(scene);
 
         if state.renderer.needs_redraw() {
@@ -1918,6 +1944,23 @@ impl PlatformWindow for WaylandWindow {
         let mut state = self.borrow_mut();
         if Some(inset) != state.client_inset {
             state.client_inset = Some(inset);
+            // xdg window geometry is double-buffered surface state. Updating
+            // only the cached inset leaves the compositor using the old CSD
+            // origin until an unrelated resize/configure arrives, which makes
+            // zoomed rendering and compositor effects disagree in the meantime.
+            let window_geometry = inset_by_tiling(
+                state.bounds.map_origin(|_| px(0.0)),
+                state.inset(),
+                state.tiling,
+            )
+            .map(|value| f32::from(value) as i32)
+            .map_size(|value| if value <= 0 { 1 } else { value });
+            state.surface_state.set_geometry(
+                window_geometry.origin.x,
+                window_geometry.origin.y,
+                window_geometry.size.width,
+                window_geometry.size.height,
+            );
             update_window(state);
         }
     }
@@ -2012,19 +2055,61 @@ struct BackgroundEffectRegion {
     corner_smoothing: f32,
 }
 
+fn kwin_uses_content_local_background_effect_coordinates() -> bool {
+    static RUNNING_UNDER_KWIN: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("KDE_FULL_SESSION").is_ok_and(|value| value == "true")
+            || ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+                .into_iter()
+                .filter_map(|name| std::env::var(name).ok())
+                .any(|desktops| {
+                    desktops
+                        .split(':')
+                        .any(|desktop| desktop.eq_ignore_ascii_case("kde"))
+                })
+    });
+    *RUNNING_UNDER_KWIN
+}
+
 impl BackgroundEffectRegion {
-    fn for_scene(scene: &Scene, surface_size: Size<Pixels>, scale: f32) -> Self {
+    fn for_scene(
+        scene: &Scene,
+        surface_size: Size<Pixels>,
+        buffer_size: Size<DevicePixels>,
+        compositor_offset: Point<Pixels>,
+    ) -> Self {
         let Some(mask) = scene.window_corner_mask else {
             return Self::full_surface(surface_size);
         };
 
-        let scale = scale.max(f32::EPSILON);
-        // The effect changes pixels even where the surface is transparent.
-        // Keep it on the scene mask so CSD shadow and corner pixels retain
-        // the compositor's unmodified background.
+        // The scene mask uses device pixels, while ext-background-effect uses
+        // integer surface-local coordinates. Fractional output scales round the
+        // drawable dimensions, so dividing by the advertised scale can drift at
+        // the far edge. Map each axis through the drawable that was configured.
+        let x_scale = f32::from(surface_size.width) / i32::from(buffer_size.width).max(1) as f32;
+        let y_scale = f32::from(surface_size.height) / i32::from(buffer_size.height).max(1) as f32;
+        // Drawable rounding can make the two ratios differ slightly. The
+        // protocol has only scalar corner radii, so choose the smaller ratio:
+        // its isotropic curve stays inside the renderer's slightly elliptical
+        // projection instead of leaking a compositor-effect pixel outside it.
+        let radius_scale = x_scale.min(y_scale);
+        // The effect changes pixels independently of the surface buffer's
+        // alpha. Keep it on the rendered window mask: extending it through a
+        // soft CSD shadow exposes the protocol's hard integer-region edge as a
+        // bright halo or corner wedge.
         Self {
-            bounds: mask.bounds.map(|value| px(value.as_f32() / scale)),
-            corner_radii: mask.corner_radii.map(|value| px(value.as_f32() / scale)),
+            bounds: Bounds {
+                origin: point(
+                    px(mask.bounds.origin.x.as_f32() * x_scale) - compositor_offset.x,
+                    px(mask.bounds.origin.y.as_f32() * y_scale) - compositor_offset.y,
+                ),
+                size: size(
+                    px(mask.bounds.size.width.as_f32() * x_scale),
+                    px(mask.bounds.size.height.as_f32() * y_scale),
+                ),
+            },
+            corner_radii: mask
+                .corner_radii
+                .map(|value| px(value.as_f32() * radius_scale)),
             corner_smoothing: mask.corner_smoothing,
         }
     }
@@ -2407,12 +2492,23 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Bounds, Corners, Point, Scene, Size, WindowCornerMask, point, px, size};
+    use gpui::{
+        Bounds, Corners, DevicePixels, Point, Scene, Size, WindowCornerMask, point, px, size,
+    };
 
     use super::{
         BackgroundBlurProtocol, BackgroundEffectRegion, background_blur_protocol,
         background_effect_rectangles,
     };
+
+    fn rectangles_cover(rectangles: &[Bounds<i32>], x: i32, y: i32) -> bool {
+        rectangles.iter().any(|rectangle| {
+            x >= rectangle.origin.x
+                && y >= rectangle.origin.y
+                && x < rectangle.origin.x + rectangle.size.width
+                && y < rectangle.origin.y + rectangle.size.height
+        })
+    }
 
     #[test]
     fn prefers_ext_background_effect_and_falls_back_to_kde_blur() {
@@ -2457,7 +2553,12 @@ mod tests {
             corner_radii: Corners::all(px(14.0)).scale(scale),
             corner_smoothing: 4.0,
         });
-        let region = BackgroundEffectRegion::for_scene(&scene, size(px(124.0), px(84.0)), scale);
+        let region = BackgroundEffectRegion::for_scene(
+            &scene,
+            size(px(124.0), px(84.0)),
+            size(DevicePixels(310), DevicePixels(210)),
+            Point::default(),
+        );
         let rectangles = background_effect_rectangles(&region);
         let first = rectangles.first().unwrap();
         let last = rectangles.last().unwrap();
@@ -2465,6 +2566,7 @@ mod tests {
         assert_eq!(region.bounds.origin, point(px(12.0), px(12.0)));
         assert_eq!(region.bounds.size, size(px(100.0), px(60.0)));
         assert_eq!(region.corner_radii, Corners::all(px(14.0)));
+        assert_eq!(region.corner_smoothing, 4.0);
         assert_eq!(first.origin.y, 12);
         assert!(first.origin.x > 12);
         assert!(first.size.width < 100);
@@ -2483,19 +2585,185 @@ mod tests {
     }
 
     #[test]
+    fn compositor_content_offset_cancels_the_csd_surface_origin() {
+        let mut scene = Scene::default();
+        scene.window_corner_mask = Some(WindowCornerMask {
+            bounds: Bounds {
+                origin: point(gpui::ScaledPixels(12.0), gpui::ScaledPixels(12.0)),
+                size: size(gpui::ScaledPixels(100.0), gpui::ScaledPixels(60.0)),
+            },
+            corner_radii: Corners::all(gpui::ScaledPixels(14.0)),
+            corner_smoothing: 4.0,
+        });
+
+        let region = BackgroundEffectRegion::for_scene(
+            &scene,
+            size(px(124.0), px(84.0)),
+            size(DevicePixels(124), DevicePixels(84)),
+            point(px(12.0), px(12.0)),
+        );
+
+        assert_eq!(region.bounds.origin, Point::default());
+        assert_eq!(region.bounds.size, size(px(100.0), px(60.0)));
+        assert_eq!(region.corner_radii, Corners::all(px(14.0)));
+    }
+
+    #[test]
+    fn background_effect_uses_the_actual_buffer_to_surface_ratio() {
+        let mut scene = Scene::default();
+        scene.window_corner_mask = Some(WindowCornerMask {
+            bounds: Bounds {
+                origin: point(gpui::ScaledPixels(12.0), gpui::ScaledPixels(13.0)),
+                size: size(gpui::ScaledPixels(102.0), gpui::ScaledPixels(50.0)),
+            },
+            corner_radii: Corners::all(gpui::ScaledPixels(17.5)),
+            corner_smoothing: 4.0,
+        });
+        let surface_size = size(px(101.0), px(61.0));
+        let buffer_size = size(DevicePixels(126), DevicePixels(76));
+        let region =
+            BackgroundEffectRegion::for_scene(&scene, surface_size, buffer_size, Point::default());
+        let x_scale = 101.0 / 126.0;
+        let y_scale = 61.0 / 76.0;
+        let close = |actual: f32, expected: f32| {
+            assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}")
+        };
+
+        close(f32::from(region.bounds.origin.x), 12.0 * x_scale);
+        close(f32::from(region.bounds.origin.y), 13.0 * y_scale);
+        close(f32::from(region.bounds.size.width), 102.0 * x_scale);
+        close(f32::from(region.bounds.size.height), 50.0 * y_scale);
+        close(
+            f32::from(region.corner_radii.top_left),
+            17.5 * x_scale.min(y_scale),
+        );
+    }
+
+    #[test]
+    fn window_mask_region_remains_symmetric_through_zoom_and_output_scale() {
+        let surface_size = size(px(801.0), px(601.0));
+        let snap = |value: f32| (value.abs() - 0.5).ceil().copysign(value);
+
+        for output_scale in [1.0_f32, 1.25, 2.0] {
+            let buffer_size = size(
+                DevicePixels((801.0 * output_scale).round() as i32),
+                DevicePixels((601.0 * output_scale).round() as i32),
+            );
+
+            for zoom in [0.8, 1.0, 1.5, 2.0] {
+                let effective_scale = output_scale * zoom;
+                let viewport_size = surface_size.map(|length| length / zoom);
+                let left = snap(12.0 * effective_scale);
+                let top = snap(12.0 * effective_scale);
+                let right = snap((f32::from(viewport_size.width) - 12.0) * effective_scale);
+                let bottom = snap((f32::from(viewport_size.height) - 12.0) * effective_scale);
+                let mut scene = Scene::default();
+                scene.window_corner_mask = Some(WindowCornerMask {
+                    bounds: Bounds::from_corners(
+                        point(gpui::ScaledPixels(left), gpui::ScaledPixels(top)),
+                        point(gpui::ScaledPixels(right), gpui::ScaledPixels(bottom)),
+                    ),
+                    corner_radii: Corners::all(gpui::ScaledPixels(14.0 * effective_scale)),
+                    corner_smoothing: 4.0,
+                });
+                let region = BackgroundEffectRegion::for_scene(
+                    &scene,
+                    surface_size,
+                    buffer_size,
+                    Point::default(),
+                );
+                let left_inset = f32::from(region.bounds.left());
+                let top_inset = f32::from(region.bounds.top());
+                let right_inset = f32::from(surface_size.width) - f32::from(region.bounds.right());
+                let bottom_inset =
+                    f32::from(surface_size.height) - f32::from(region.bounds.bottom());
+                let radius = f32::from(region.corner_radii.top_left);
+
+                assert!(
+                    (left_inset - right_inset).abs() < 1.1,
+                    "output_scale={output_scale}, zoom={zoom}: {left_inset} != {right_inset}",
+                );
+                assert!(
+                    (top_inset - bottom_inset).abs() < 1.1,
+                    "output_scale={output_scale}, zoom={zoom}: {top_inset} != {bottom_inset}",
+                );
+                assert!(
+                    (radius - 14.0 * zoom).abs() < 1.1,
+                    "output_scale={output_scale}, zoom={zoom}: radius={radius}",
+                );
+
+                let rectangles = background_effect_rectangles(&region);
+                assert!(rectangles_cover(&rectangles, 400, top_inset.ceil() as i32));
+                assert!(rectangles_cover(&rectangles, left_inset.ceil() as i32, 300));
+                assert!(!rectangles_cover(&rectangles, 400, 0));
+                assert!(!rectangles_cover(&rectangles, 0, 300));
+                assert!(!rectangles_cover(&rectangles, 0, 0));
+                assert!(!rectangles_cover(&rectangles, 800, 600));
+            }
+        }
+    }
+
+    #[test]
+    fn window_mask_region_respects_partially_tiled_edges() {
+        let mut scene = Scene::default();
+        scene.window_corner_mask = Some(WindowCornerMask {
+            bounds: Bounds {
+                origin: point(gpui::ScaledPixels(0.0), gpui::ScaledPixels(12.0)),
+                size: size(gpui::ScaledPixels(112.0), gpui::ScaledPixels(60.0)),
+            },
+            corner_radii: Corners {
+                top_left: gpui::ScaledPixels(0.0),
+                top_right: gpui::ScaledPixels(14.0),
+                bottom_right: gpui::ScaledPixels(14.0),
+                bottom_left: gpui::ScaledPixels(0.0),
+            },
+            corner_smoothing: 4.0,
+        });
+        let region = BackgroundEffectRegion::for_scene(
+            &scene,
+            size(px(124.0), px(84.0)),
+            size(DevicePixels(124), DevicePixels(84)),
+            Point::default(),
+        );
+        let rectangles = background_effect_rectangles(&region);
+
+        assert_eq!(
+            region.corner_radii,
+            Corners {
+                top_left: px(0.0),
+                top_right: px(14.0),
+                bottom_right: px(14.0),
+                bottom_left: px(0.0),
+            }
+        );
+        assert!(rectangles_cover(&rectangles, 0, 12));
+        assert!(rectangles_cover(&rectangles, 0, 71));
+        assert!(!rectangles_cover(&rectangles, 0, 11));
+        assert!(!rectangles_cover(&rectangles, 123, 42));
+    }
+
+    #[test]
     fn square_window_mask_keeps_the_shadow_outside_the_blur_region() {
-        let region = BackgroundEffectRegion {
+        let mut scene = Scene::default();
+        scene.window_corner_mask = Some(WindowCornerMask {
             bounds: Bounds {
                 origin: point(px(12.0), px(12.0)),
                 size: size(px(100.0), px(60.0)),
-            },
-            corner_radii: Corners::default(),
+            }
+            .scale(1.0),
+            corner_radii: Corners::default().scale(1.0),
             corner_smoothing: 4.0,
-        };
+        });
+        let region = BackgroundEffectRegion::for_scene(
+            &scene,
+            size(px(124.0), px(84.0)),
+            size(DevicePixels(124), DevicePixels(84)),
+            Point::default(),
+        );
+        let rectangles = background_effect_rectangles(&region);
 
-        assert_eq!(region.corner_radii, Corners::default());
         assert_eq!(
-            background_effect_rectangles(&region),
+            rectangles,
             [Bounds {
                 origin: Point { x: 12, y: 12 },
                 size: Size {

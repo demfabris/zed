@@ -86,6 +86,10 @@ struct GlobalParams {
     window_mask_origin: vec2<f32>,
     window_mask_size: vec2<f32>,
     window_mask_radii: vec4<f32>,
+    clip_window_shadows: u32,
+    _window_mask_pad_0: u32,
+    _window_mask_pad_1: u32,
+    _window_mask_pad_2: u32,
 }
 
 struct GammaParams {
@@ -1103,6 +1107,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         let element_distance = quad_sdf_smooth(input.position.xy, shadow.element_bounds,
         shadow.element_corner_radii, shadow.corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
+    } else if (globals.clip_window_shadows != 0u) {
+        alpha *= window_mask_alpha(input.position.xy);
     }
 
     return blend_color(input.color, alpha);
