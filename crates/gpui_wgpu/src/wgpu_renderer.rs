@@ -68,6 +68,8 @@ struct GlobalParams {
     window_mask_origin: [f32; 2],
     window_mask_size: [f32; 2],
     window_mask_radii: [f32; 4],
+    clip_window_shadows: u32,
+    _window_mask_pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -239,6 +241,7 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    clip_window_shadows: bool,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1082,6 +1085,16 @@ impl WgpuRenderer {
         self.core().is_some_and(|core| core.dual_source_blending)
     }
 
+    /// Clips drop shadows to the scene-wide window mask. Wayland compositors
+    /// cannot blur a transparent CSD shadow margin without also exposing the
+    /// effect in its corner wedges, so an ext-background-effect client can use
+    /// this to present a clean shadowless rounded window instead.
+    pub fn set_clip_window_shadows(&mut self, clip: bool) {
+        if let Some(core) = self.core_mut() {
+            core.clip_window_shadows = clip;
+        }
+    }
+
     /// Returns `None` once GPU resources have been released by `destroy` or a pending
     /// device recovery.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
@@ -1345,6 +1358,7 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
+            clip_window_shadows: false,
         }
     }
 
@@ -1438,6 +1452,8 @@ impl WgpuRendererCore {
                 window_mask.corner_radii.bottom_right.0,
                 window_mask.corner_radii.bottom_left.0,
             ],
+            clip_window_shadows: self.clip_window_shadows as u32,
+            _window_mask_pad: [0; 3],
         };
         let path_globals = GlobalParams {
             premultiplied_alpha: 0,
