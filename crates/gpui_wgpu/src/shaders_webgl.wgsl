@@ -202,7 +202,7 @@ fn load_shadow(instance_id: u32) -> Shadow {
         read_bounds(&cursor),
         read_corners(&cursor),
         read_word(&cursor),
-        read_word(&cursor),
+        read_f32(&cursor),
     );
 }
 
@@ -248,7 +248,7 @@ fn load_mono_sprite(instance_id: u32) -> MonochromeSprite {
 }
 
 fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
-    var cursor = instance_cursor(instance_id * 24u);
+    var cursor = instance_cursor(instance_id * 26u);
     return PolychromeSprite(
         read_word(&cursor),
         read_word(&cursor),
@@ -257,14 +257,18 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_bounds(&cursor),
         read_bounds(&cursor),
         read_corners(&cursor),
+        read_f32(&cursor),
+        read_word(&cursor),
         read_atlas_tile(&cursor),
     );
 }
 
 fn load_surface(instance_id: u32) -> SurfaceParams {
-    var cursor = instance_cursor(instance_id * 8u);
+    var cursor = instance_cursor(instance_id * 14u);
     return SurfaceParams(
         read_bounds(&cursor),
         read_bounds(&cursor),
+        read_corners(&cursor),
+        read_f32(&cursor),
     );
 }
