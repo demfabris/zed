@@ -1395,6 +1395,7 @@ struct SurfaceParams {
 struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) texture_position: vec2<f32>,
+    @location(1) @interpolate(flat) surface_id: u32,
     @location(3) clip_distances: vec4<f32>,
 }
 
@@ -1406,6 +1407,7 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) in
     var out = SurfaceVarying();
     out.position = to_device_position(unit_vertex, surface.bounds);
     out.texture_position = unit_vertex;
+    out.surface_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, surface.bounds, surface.content_mask);
     return out;
 }
@@ -1425,9 +1427,10 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     // Cut the texture with the same superellipse the pane's quads draw, as
     // surface_fragment does on Metal; the content mask is rectangular, so
     // without this a surface in a rounded pane overflows the frame's corners.
+    let surface = load_surface(input.surface_id);
     let coverage = saturate(0.5 - quad_sdf_smooth(
-        input.position.xy, surface_locals.bounds,
-        surface_locals.corner_radii, surface_locals.corner_smoothing));
+        input.position.xy, surface.bounds,
+        surface.corner_radii, surface.corner_smoothing));
     let mask = window_mask_alpha(input.position.xy) * coverage;
     if (globals.premultiplied_alpha != 0u) {
         return sample * mask;
