@@ -472,6 +472,7 @@ impl WgpuRenderer {
                 .unwrap_or(wgpu::PresentMode::Fifo),
             desired_maximum_frame_latency: 2,
             alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
         };
         // Configure the surface immediately. The adapter selection process already validated
@@ -1198,7 +1199,7 @@ impl WgpuRenderer {
             return false;
         }
 
-        frame.present();
+        core.resources.queue.present(frame);
         true
     }
 }
@@ -2542,7 +2543,10 @@ impl WgpuHeadlessRenderer {
             .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
         self.check_gpu_errors()?;
 
-        let mapped_data = readback_buffer.slice(..).get_mapped_range();
+        let mapped_data = readback_buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| anyhow::anyhow!("Failed to read headless readback buffer: {error}"))?;
         let pixel_capacity = usize::try_from(u64::from(bytes_per_row) * u64::from(height))
             .map_err(|_| anyhow::anyhow!("Headless image size exceeds addressable memory"))?;
         let mut pixels = Vec::with_capacity(pixel_capacity);
