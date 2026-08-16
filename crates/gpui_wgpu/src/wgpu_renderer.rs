@@ -439,6 +439,7 @@ impl WgpuRenderer {
                 .unwrap_or(wgpu::PresentMode::Fifo),
             desired_maximum_frame_latency: 2,
             alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
         };
         // Configure the surface immediately. The adapter selection process already validated
@@ -1402,7 +1403,7 @@ impl WgpuRenderer {
             return false;
         }
 
-        frame.present();
+        self.resources().queue.present(frame);
         true
     }
 
