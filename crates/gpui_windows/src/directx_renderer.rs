@@ -742,7 +742,6 @@ impl DirectXRenderer {
             return Ok(());
         }
         let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
         for (offset, surface) in surfaces.iter().enumerate() {
             // The view is built per draw rather than cached against the texture
             // pointer: the embedder owns these textures and may recycle a slot
@@ -753,11 +752,12 @@ impl DirectXRenderer {
                 continue;
             };
             self.pipelines.surfaces.draw_range_with_texture(
-                &devices.device,
                 &devices.device_context,
                 slice::from_ref(&view),
-                slice::from_ref(&resources.viewport),
-                slice::from_ref(&self.globals.global_params_buffer),
+                self.globals
+                    .batch_params_buffer
+                    .as_ref()
+                    .context("batch params buffer missing")?,
                 slice::from_ref(&self.globals.surface_sampler),
                 (start + offset) as u32,
                 1,
