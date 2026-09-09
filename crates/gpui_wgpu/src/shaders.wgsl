@@ -961,8 +961,18 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return blend_color(color,
-        saturate(antialias_threshold - outer_sdf) * window_mask_alpha(input.position.xy));
+    let outer_coverage = saturate(antialias_threshold - outer_sdf);
+    let matches_window_mask = globals.window_mask_size.x > 0.0 &&
+        all(quad.bounds.origin == globals.window_mask_origin) &&
+        all(quad.bounds.size == globals.window_mask_size) &&
+        all(vec4<f32>(quad.corner_radii.top_left, quad.corner_radii.top_right,
+            quad.corner_radii.bottom_right, quad.corner_radii.bottom_left) ==
+            globals.window_mask_radii) &&
+        quad.corner_smoothing == globals.window_mask_smoothing;
+    if (matches_window_mask) {
+        return blend_color(color, outer_coverage);
+    }
+    return blend_color(color, outer_coverage * window_mask_alpha(input.position.xy));
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
