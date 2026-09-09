@@ -1350,7 +1350,7 @@ fn build_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1384,7 +1384,7 @@ fn build_premultiplied_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1683,5 +1683,128 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Quad, Shadow, hsla, px};
+
+    #[test]
+    fn translucent_layers_preserve_source_over_alpha() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        renderer.opaque = false;
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(16.0), px(16.0))).scale(1.0);
+        for (alphas, expected) in [
+            ([0.0, 0.5, 0.0], 128_u8),
+            ([0.93, 0.5, 0.0], 246),
+            ([0.93, 0.5, 0.5], 251),
+            ([0.93, 0.5, 1.0], 255),
+        ] {
+            let mut scene = Scene::default();
+            for alpha in alphas {
+                let mut quad = Quad::default();
+                quad.bounds = bounds;
+                quad.content_mask.bounds = bounds;
+                quad.background = hsla(0.0, 0.0, 0.15, alpha).into();
+                scene.insert_primitive(quad);
+            }
+            scene.finish();
+            let image = renderer.render_scene_to_image(&scene, size(16.into(), 16.into()))?;
+            assert!(image.get_pixel(8, 8)[3].abs_diff(expected) <= 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blurred_shadows_follow_smoothed_corners() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        renderer.opaque = false;
+        let bounds = Bounds::new(point(px(20.0), px(20.0)), size(px(96.0), px(96.0))).scale(1.0);
+        for (smoothing, radius, diagonal) in [(2.0, 32.0, 29), (4.0, 32.0, 25), (4.0, 48.0, 34)] {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Shadow {
+                order: Default::default(),
+                blur_radius: px(2.0).scale(1.0),
+                bounds,
+                corner_radii: gpui::Corners::all(px(radius).scale(1.0)),
+                content_mask: gpui::ContentMask {
+                    bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(136.0), px(136.0)))
+                        .scale(1.0),
+                },
+                color: hsla(0.0, 0.0, 1.0, 1.0),
+                element_bounds: bounds,
+                element_corner_radii: gpui::Corners::all(px(radius).scale(1.0)),
+                inset: 0,
+                corner_smoothing: smoothing,
+            });
+            scene.finish();
+            let image = renderer.render_scene_to_image(&scene, size(136.into(), 136.into()))?;
+            let edge_alpha = image.get_pixel(20, 68)[3];
+            let far = 135 - diagonal;
+            for (x, y) in [
+                (diagonal, diagonal),
+                (far, diagonal),
+                (diagonal, far),
+                (far, far),
+            ] {
+                let corner_alpha = image.get_pixel(x, y)[3];
+                assert!(
+                    corner_alpha.abs_diff(edge_alpha) <= 32,
+                    "detached shadow at ({x}, {y}), smoothing={smoothing}, radius={radius}: corner={corner_alpha}, edge={edge_alpha}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn faint_inset_shadows_dither_dark_composites() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(256.0), px(1024.0))).scale(1.0);
+
+        for opacity in [0.0, 0.032] {
+            let mut scene = Scene::default();
+            let mut background = Quad::default();
+            background.bounds = bounds;
+            background.content_mask.bounds = bounds;
+            background.background = hsla(0.0, 0.0, 0.15, 1.0).into();
+            scene.insert_primitive(background);
+            scene.insert_primitive(Shadow {
+                order: Default::default(),
+                blur_radius: px(96.0).scale(1.0),
+                bounds,
+                corner_radii: Default::default(),
+                content_mask: background.content_mask,
+                color: hsla(0.0, 0.0, 1.0, opacity),
+                element_bounds: bounds,
+                element_corner_radii: Default::default(),
+                inset: 1,
+                corner_smoothing: 2.0,
+            });
+            scene.finish();
+            let image = renderer.render_scene_to_image(&scene, size(256.into(), 1024.into()))?;
+            let values: Vec<_> = (400..600).map(|y| image.get_pixel(16, y)[0]).collect();
+            let min = *values.iter().min().unwrap();
+            let max = *values.iter().max().unwrap();
+            assert!(image.pixels().all(|pixel| pixel[3] == 255));
+            if opacity == 0.0 {
+                assert!(image.pixels().all(|pixel| pixel[0] == 38));
+            } else {
+                assert!(min < max, "flat band: min={min}, max={max}");
+                assert!(max - min <= 2, "visible noise: min={min}, max={max}");
+                let mean =
+                    values.iter().map(|value| f32::from(*value)).sum::<f32>() / values.len() as f32;
+                assert!(
+                    (mean - 41.0).abs() <= 0.5,
+                    "brightness changed: mean={mean}"
+                );
+            }
+        }
+        Ok(())
     }
 }

@@ -339,9 +339,14 @@ fn erf(v: vec2<f32>) -> vec2<f32> {
     return s - s / (r2 * r2);
 }
 
-fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>) -> f32 {
+fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>, corner_smoothing: f32) -> f32 {
   let delta = min(half_size.y - corner - abs(y), 0.0);
-  let curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+  var reach = sqrt(max(0.0, corner * corner - delta * delta));
+  if (corner > 0.0 && corner_smoothing > 2.001) {
+    reach = corner * pow(max(0.0, 1.0 - pow(abs(delta) / corner, corner_smoothing)),
+                         1.0 / corner_smoothing);
+  }
+  let curved = half_size.x - corner + reach;
   let integral = 0.5 + 0.5 * erf((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;
 }
@@ -1085,6 +1090,8 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
             shadow.corner_radii, shadow.corner_smoothing);
         alpha = saturate(0.5 - distance);
     } else {
+        let smoothing = select(shadow.corner_smoothing, 2.0,
+            corner_radius >= min(half_size.x, half_size.y) - 0.01);
         // The signal is only non-zero in a limited range, so don't waste samples
         let low = center_to_point.y - half_size.y;
         let high = center_to_point.y + half_size.y;
@@ -1097,7 +1104,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha = 0.0;
         for (var i = 0; i < 4; i += 1) {
             let blur = blur_along_x(center_to_point.x, center_to_point.y - y,
-                shadow.blur_radius, corner_radius, half_size);
+                shadow.blur_radius, corner_radius, half_size, smoothing);
             alpha +=  blur * gaussian(y, shadow.blur_radius) * step;
             y += step;
         }
@@ -1114,7 +1121,13 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha *= window_mask_alpha(input.position.xy);
     }
 
-    return blend_color(input.color, alpha);
+    var color = vec4<f32>(input.color.rgb, input.color.a * alpha);
+    if (shadow.inset != 0u && shadow.blur_radius > 0.0) {
+        let seed = input.position.xy * 0.6180339887;
+        let noise = fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+        color.a = floor(saturate(color.a) * 128.0 + noise) / 128.0;
+    }
+    return blend_color(color, 1.0);
 }
 
 // --- path rasterization --- //

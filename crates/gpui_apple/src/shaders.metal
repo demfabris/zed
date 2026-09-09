@@ -34,7 +34,7 @@ float quad_sdf_impl(float2 center_to_point, float corner_radius,
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
+                   float2 half_size, float corner_smoothing);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
@@ -539,6 +539,8 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                      shadow.corner_radii, shadow.corner_smoothing);
     alpha = saturate(0.5 - distance);
   } else {
+    float smoothing = corner_radius >= min(half_size.x, half_size.y) - 0.01
+        ? 2.0 : shadow.corner_smoothing;
     // The signal is only non-zero in a limited range, so don't waste samples
     float low = point.y - half_size.y;
     float high = point.y + half_size.y;
@@ -551,7 +553,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha = 0.;
     for (int i = 0; i < 4; i++) {
       alpha += blur_along_x(point.x, point.y - y, shadow.blur_radius,
-                            corner_radius, half_size) *
+                            corner_radius, half_size, smoothing) *
                gaussian(y, shadow.blur_radius) * step;
       y += step;
     }
@@ -567,7 +569,13 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha *= saturate(0.5 - element_distance);
   }
 
-  return input.color * float4(1., 1., 1., alpha);
+  float4 color = input.color * float4(1., 1., 1., alpha);
+  if (shadow.inset != 0u && shadow.blur_radius > 0.) {
+    float2 seed = input.position.xy * 0.6180339887;
+    float noise = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+    color.a = floor(saturate(color.a) * 128. + noise) / 128.;
+  }
+  return color;
 }
 
 struct UnderlineVertexOutput {
@@ -1165,10 +1173,14 @@ float2 erf(float2 x) {
 }
 
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size) {
+                   float2 half_size, float corner_smoothing) {
   float delta = min(half_size.y - corner - abs(y), 0.);
-  float curved =
-      half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
+  float reach = sqrt(max(0., corner * corner - delta * delta));
+  if (corner > 0. && corner_smoothing > 2.001) {
+    reach = corner * pow(max(0., 1. - pow(abs(delta) / corner, corner_smoothing)),
+                         1. / corner_smoothing);
+  }
+  float curved = half_size.x - corner + reach;
   float2 integral =
       0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;

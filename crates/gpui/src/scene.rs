@@ -617,8 +617,7 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     /// Superellipse exponent for the corners, matching the element the shadow
-    /// traces. Only honored for unblurred shadows: a blur wide enough to see
-    /// smears the difference away. Occupies what was alignment padding.
+    /// traces.
     pub corner_smoothing: f32,
 }
 
