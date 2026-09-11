@@ -6,6 +6,17 @@ using namespace metal;
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
+float4 over_gamma(float4 below, float4 above);
+float4 mix_coverage(float4 from, float4 to, float coverage);
+float edge_coverage(float distance, float antialias_threshold);
+float dither_alpha(float alpha, float2 position);
+
+// Half the width of the antialiasing ramp across an edge, in device pixels.
+// The fixed-function pipelines resolve an edge over one pixel. The Apple GPU
+// pipelines composite in linear light and can afford a 1.5px ramp, which
+// hides the staircase a saturated curve shows against a dark plane.
+constant float ANTIALIAS_THRESHOLD = 0.5;
+constant float FETCH_ANTIALIAS_THRESHOLD = 0.75;
 float4 srgb_to_oklab(float4 color);
 float4 oklab_to_srgb(float4 color);
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -100,9 +111,15 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
-                              constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
+struct QuadShade {
+  float4 background;
+  float4 border;
+  float border_coverage;
+  float coverage;
+};
+
+QuadShade quad_shade(QuadFragmentInput input, constant Quad *quads,
+                     float antialias_threshold) {
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
@@ -118,17 +135,13 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       quad.border_widths.right == 0.0 &&
       quad.border_widths.bottom == 0.0 &&
       unrounded) {
-    return background_color;
+    return QuadShade{background_color, float4(0.0), 0.0, 1.0};
   }
 
   float2 size = float2(quad.bounds.size.width, quad.bounds.size.height);
   float2 half_size = size / 2.0;
   float2 point = input.position.xy - float2(quad.bounds.origin.x, quad.bounds.origin.y);
   float2 center_to_point = point - half_size;
-
-  // Signed distance field threshold for inclusion of pixels. 0.5 is the
-  // minimum distance between the center of the pixel and the edge.
-  const float antialias_threshold = 0.5;
 
   // Radius of the nearest corner
   float corner_radius = pick_corner_radius(center_to_point, quad.corner_radii);
@@ -188,7 +201,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
 
   // Fast path for points that must be part of the background
   if (is_within_inner_straight_border && !is_near_rounded_corner) {
-    return background_color;
+    return QuadShade{background_color, float4(0.0), 0.0, 1.0};
   }
 
   // Signed distance of the point to the outside edge of the quad's border
@@ -222,9 +235,10 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   // Negative when inside the border
   float border_sdf = max(inner_sdf, outer_sdf);
 
-  float4 color = background_color;
+  float4 border_color = float4(0.0);
+  float border_coverage = 0.0;
   if (border_sdf < antialias_threshold) {
-    float4 border_color = input.border_color;
+    border_color = input.border_color;
 
     // Dashed border logic when border_style == 1
     if (quad.border_style == 1) {
@@ -400,14 +414,41 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
       }
     }
 
-    // Blend the border on top of the background and then linearly interpolate
-    // between the two as we slide inside the background.
-    float4 blended_border = over(background_color, border_color);
-    color = mix(background_color, blended_border,
-                saturate(antialias_threshold - inner_sdf));
+    border_coverage = edge_coverage(inner_sdf, antialias_threshold);
   }
 
-  return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+  return QuadShade{background_color, border_color, border_coverage,
+                   edge_coverage(outer_sdf, antialias_threshold)};
+}
+
+fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
+                              constant Quad *quads
+                              [[buffer(QuadInputIndex_Quads)]]) {
+  QuadShade shade = quad_shade(input, quads, ANTIALIAS_THRESHOLD);
+  float4 color = shade.background;
+  if (shade.border_coverage > 0.0) {
+    // Blend the border on top of the background and then linearly interpolate
+    // between the two as we slide inside the background.
+    float4 blended_border = over(shade.background, shade.border);
+    color = mix(shade.background, blended_border, shade.border_coverage);
+  }
+  return color * float4(1.0, 1.0, 1.0, shade.coverage);
+}
+
+// Apple GPUs read the pixel they shade, so edge coverage can be resolved in
+// linear light while the fill's own alpha keeps the gamma-space blend the
+// fixed-function path applies.
+fragment float4 quad_fragment_fetch(QuadFragmentInput input [[stage_in]],
+                                    constant Quad *quads
+                                    [[buffer(QuadInputIndex_Quads)]],
+                                    float4 dst [[color(0)]]) {
+  QuadShade shade = quad_shade(input, quads, FETCH_ANTIALIAS_THRESHOLD);
+  float4 covered = over_gamma(dst, shade.background);
+  if (shade.border_coverage > 0.0) {
+    covered = mix_coverage(covered, over_gamma(covered, shade.border),
+                           shade.border_coverage);
+  }
+  return mix_coverage(dst, covered, shade.coverage);
 }
 
 // Returns the dash velocity of a corner given the dash velocity of the two
@@ -441,7 +482,7 @@ float dash_alpha(
   // Signed distance for the dash, negative values are inside the dash
   float signed_distance = abs(centered) - half_length;
   // Antialiased alpha based on the signed distance
-  return saturate(antialias_threshold - signed_distance / dash_velocity);
+  return edge_coverage(signed_distance / dash_velocity, antialias_threshold);
 }
 
 // This approximates distance to the nearest point to a quarter ellipse in a way
@@ -508,9 +549,14 @@ vertex ShadowVertexOutput shadow_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
-                                constant Shadow *shadows
-                                [[buffer(ShadowInputIndex_Shadows)]]) {
+struct ShadowShade {
+  float4 color;
+  float coverage;
+  bool dithered;
+};
+
+ShadowShade shadow_shade(ShadowFragmentInput input, constant Shadow *shadows,
+                         float antialias_threshold) {
   Shadow shadow = shadows[input.shadow_id];
 
   float2 origin = float2(shadow.bounds.origin.x, shadow.bounds.origin.y);
@@ -533,11 +579,12 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     }
   }
 
-  float alpha;
+  float alpha = 1.;
+  float coverage = 1.;
   if (shadow.blur_radius == 0.) {
     float distance = quad_sdf_smooth(input.position.xy, shadow.bounds,
                                      shadow.corner_radii, shadow.corner_smoothing);
-    alpha = saturate(0.5 - distance);
+    coverage = edge_coverage(distance, antialias_threshold);
   } else {
     float smoothing = corner_radius >= min(half_size.x, half_size.y) - 0.01
         ? 2.0 : shadow.corner_smoothing;
@@ -561,21 +608,42 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   if (shadow.inset != 0u) {
     // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
-    // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
-    alpha = 1. - alpha;
+    if (shadow.blur_radius == 0.) {
+      coverage = 1. - coverage;
+    } else {
+      alpha = 1. - alpha;
+    }
     float element_distance = quad_sdf_smooth(input.position.xy, shadow.element_bounds,
                                              shadow.element_corner_radii,
                                              shadow.corner_smoothing);
-    alpha *= saturate(0.5 - element_distance);
+    coverage *= edge_coverage(element_distance, antialias_threshold);
   }
 
-  float4 color = input.color * float4(1., 1., 1., alpha);
-  if (shadow.inset != 0u && shadow.blur_radius > 0.) {
-    float2 seed = input.position.xy * 0.6180339887;
-    float noise = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-    color.a = floor(saturate(color.a) * 128. + noise) / 128.;
+  return ShadowShade{input.color * float4(1., 1., 1., alpha), coverage,
+                     shadow.inset != 0u && shadow.blur_radius > 0.};
+}
+
+fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
+                                constant Shadow *shadows
+                                [[buffer(ShadowInputIndex_Shadows)]]) {
+  ShadowShade shade = shadow_shade(input, shadows, ANTIALIAS_THRESHOLD);
+  float4 color = shade.color * float4(1., 1., 1., shade.coverage);
+  if (shade.dithered) {
+    color.a = dither_alpha(color.a, input.position.xy);
   }
   return color;
+}
+
+fragment float4 shadow_fragment_fetch(ShadowFragmentInput input [[stage_in]],
+                                      constant Shadow *shadows
+                                      [[buffer(ShadowInputIndex_Shadows)]],
+                                      float4 dst [[color(0)]]) {
+  ShadowShade shade = shadow_shade(input, shadows, FETCH_ANTIALIAS_THRESHOLD);
+  float4 color = shade.color;
+  if (shade.dithered) {
+    color.a = dither_alpha(color.a, input.position.xy);
+  }
+  return mix_coverage(dst, over_gamma(dst, color), shade.coverage);
 }
 
 struct UnderlineVertexOutput {
@@ -1002,6 +1070,47 @@ float3 srgb_to_linear(float3 color) {
 
 float3 linear_to_srgb(float3 color) {
   return pow(color, float3(1.0 / 2.2));
+}
+
+// The fixed-function source-over the other pipelines get: `above` is a
+// straight color, `below` and the result are premultiplied sRGB as stored in
+// the framebuffer.
+float4 over_gamma(float4 below, float4 above) {
+  return float4(above.rgb * above.a + below.rgb * (1.0 - above.a),
+                above.a + below.a * (1.0 - above.a));
+}
+
+// Resolves edge coverage between two premultiplied sRGB framebuffer values in
+// linear light, so a partially covered pixel of a saturated color keeps its
+// hue instead of dropping toward black. Full and zero coverage return their
+// operand untouched.
+float4 mix_coverage(float4 from, float4 to, float coverage) {
+  if (coverage <= 0.0) {
+    return from;
+  }
+  if (coverage >= 1.0) {
+    return to;
+  }
+  float3 from_linear =
+      srgb_to_linear(from.a > 0.0 ? from.rgb / from.a : float3(0.0)) * from.a;
+  float3 to_linear =
+      srgb_to_linear(to.a > 0.0 ? to.rgb / to.a : float3(0.0)) * to.a;
+  float alpha = mix(from.a, to.a, coverage);
+  float3 premultiplied = mix(from_linear, to_linear, coverage);
+  float3 straight = alpha > 0.0 ? premultiplied / alpha : float3(0.0);
+  return float4(linear_to_srgb(straight) * alpha, alpha);
+}
+
+// Coverage of a pixel whose center is `distance` from an edge: 1 when it is
+// `antialias_threshold` inside, 0 when as far outside, linear between.
+float edge_coverage(float distance, float antialias_threshold) {
+  return saturate((antialias_threshold - distance) / (2.0 * antialias_threshold));
+}
+
+float dither_alpha(float alpha, float2 position) {
+  float2 seed = position * 0.6180339887;
+  float noise = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
+  return floor(saturate(alpha) * 128. + noise) / 128.;
 }
 
 // Converts a sRGB color to the Oklab color space.

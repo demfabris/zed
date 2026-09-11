@@ -135,7 +135,7 @@ mod macos_build {
                 "macosx",
                 "metal",
                 "-gline-tables-only",
-                "-mmacosx-version-min=10.15.7",
+                "-mmacosx-version-min=11.0",
                 "-MO",
                 "-c",
                 shader_path,

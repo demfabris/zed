@@ -277,22 +277,45 @@ impl MetalRenderer {
             "path_sprite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "shadows",
-            "shadow_vertex",
-            "shadow_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let quads_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "quads",
-            "quad_vertex",
-            "quad_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
+        let (shadows_pipeline_state, quads_pipeline_state) = if is_apple_gpu {
+            (
+                build_fetch_pipeline_state(
+                    &device,
+                    &library,
+                    "shadows",
+                    "shadow_vertex",
+                    "shadow_fragment_fetch",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_fetch_pipeline_state(
+                    &device,
+                    &library,
+                    "quads",
+                    "quad_vertex",
+                    "quad_fragment_fetch",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+            )
+        } else {
+            (
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "shadows",
+                    "shadow_vertex",
+                    "shadow_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+                build_pipeline_state(
+                    &device,
+                    &library,
+                    "quads",
+                    "quad_vertex",
+                    "quad_fragment",
+                    MTLPixelFormat::BGRA8Unorm,
+                ),
+            )
+        };
         let underlines_pipeline_state = build_pipeline_state(
             &device,
             &library,
@@ -1343,6 +1366,37 @@ fn build_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+/// A pipeline whose fragment function reads the pixel it shades through
+/// `[[color(0)]]` and writes the composited result itself, so fixed-function
+/// blending is off. Only Apple GPUs can build one.
+fn build_fetch_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 fn build_premultiplied_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -1676,6 +1730,98 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 mod tests {
     use super::*;
     use gpui::{Quad, Shadow, hsla, px};
+
+    #[test]
+    fn edge_coverage_blends_in_linear_light_on_apple_gpus() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        renderer.opaque = false;
+        let linear = renderer.is_apple_gpu;
+        let channel = |value: f32| (value * 255.0).round() as u8;
+        let gamma_mix = |source: f32, destination: f32, alpha: f32| {
+            source * alpha + destination * (1.0 - alpha)
+        };
+        let edge_mix = move |source: f32, destination: f32, coverage: f32| {
+            if linear {
+                (source.powf(2.2) * coverage + destination.powf(2.2) * (1.0 - coverage))
+                    .powf(1.0 / 2.2)
+            } else {
+                gamma_mix(source, destination, coverage)
+            }
+        };
+        let full = Bounds::new(point(px(0.0), px(0.0)), size(px(16.0), px(16.0))).scale(1.0);
+        let circle = gpui::Corners::all(px(8.0).scale(1.0));
+        let threshold = if linear { 0.75 } else { 0.5 };
+        let diagonal_coverage =
+            ((threshold - (5.5_f32.hypot(5.5) - 8.0)) / (2.0 * threshold)).clamp(0.0, 1.0);
+        let mut background = Quad::default();
+        background.bounds = full;
+        background.content_mask.bounds = full;
+        background.background = hsla(0.0, 0.0, 0.2, 1.0).into();
+
+        let mut disc = background;
+        disc.corner_radii = circle;
+        disc.background = hsla(0.0, 0.0, 0.9, 1.0).into();
+        let mut scene = Scene::default();
+        scene.insert_primitive(background);
+        scene.insert_primitive(disc);
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, size(16.into(), 16.into()))?;
+        let pixel = image.get_pixel(13, 13);
+        assert!(
+            pixel[0].abs_diff(channel(edge_mix(0.9, 0.2, diagonal_coverage))) <= 1,
+            "quad edge: {pixel:?}"
+        );
+        assert!(image.get_pixel(8, 8)[0].abs_diff(channel(0.9)) <= 1);
+        assert_eq!(pixel[3], 255);
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(background);
+        scene.insert_primitive(Shadow {
+            order: Default::default(),
+            blur_radius: px(0.0).scale(1.0),
+            bounds: full,
+            corner_radii: circle,
+            content_mask: background.content_mask,
+            color: hsla(0.0, 0.0, 0.9, 1.0),
+            element_bounds: full,
+            element_corner_radii: circle,
+            inset: 0,
+            corner_smoothing: 2.0,
+        });
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, size(16.into(), 16.into()))?;
+        let pixel = image.get_pixel(13, 13);
+        assert!(
+            pixel[0].abs_diff(channel(edge_mix(0.9, 0.2, diagonal_coverage))) <= 1,
+            "shadow edge: {pixel:?}"
+        );
+
+        let mut wash = background;
+        wash.background = hsla(0.0, 0.0, 0.9, 0.5).into();
+        let mut scene = Scene::default();
+        scene.insert_primitive(background);
+        scene.insert_primitive(wash);
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, size(16.into(), 16.into()))?;
+        let pixel = image.get_pixel(8, 8);
+        assert!(
+            pixel[0].abs_diff(channel(gamma_mix(0.9, 0.2, 0.5))) <= 1,
+            "translucent fill: {pixel:?}"
+        );
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(wash);
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, size(16.into(), 16.into()))?;
+        let pixel = image.get_pixel(8, 8);
+        assert!(
+            pixel[0].abs_diff(channel(0.9 * 0.5)) <= 1,
+            "over clear: {pixel:?}"
+        );
+        assert!(pixel[3].abs_diff(128) <= 1);
+        Ok(())
+    }
 
     #[test]
     fn translucent_layers_preserve_source_over_alpha() -> Result<()> {
