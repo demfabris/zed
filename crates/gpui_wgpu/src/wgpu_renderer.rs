@@ -1632,17 +1632,14 @@ impl WgpuRenderer {
             };
             let instances =
                 self.write_instance_binding("surfaces_bind_group", instance_offset, &[params])?;
-            let texture = self
-                .create_texture_bind_group("surface_texture_bind_group", &surface.texture_view);
+            let texture =
+                self.create_texture_bind_group("surface_texture_bind_group", &surface.texture_view);
             let resources = self.resources();
             pass.set_pipeline(&resources.pipelines.surfaces);
             pass.set_bind_group(0, &resources.globals_bind_group, &[]);
             pass.set_bind_group(1, &instances.bind_group, &[]);
             pass.set_bind_group(2, &texture, &[]);
-            pass.draw(
-                0..4,
-                instances.first_instance..instances.first_instance + 1,
-            );
+            pass.draw(0..4, instances.first_instance..instances.first_instance + 1);
         }
         Ok(())
     }
@@ -2276,13 +2273,15 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 42 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 16 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
-        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<PolychromeSprite>(), 26 * 4);
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        assert_eq!(std::mem::size_of::<SurfaceParams>(), 14 * 4);
     }
 }

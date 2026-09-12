@@ -1,7 +1,8 @@
 use crate::util::round_half_toward_zero;
 use crate::{
     App, AtlasTile, Bounds, GlyphRenderOptions, Half, Hsla, IsZero, LineLayout, Pixels, Point,
-    RenderGlyphParams, Result, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
+    RenderGlyphParams, Result, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels,
+    SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
     WrappedLineLayout, black, fill, point, px, size,
 };
 use derive_more::{Deref, DerefMut};
