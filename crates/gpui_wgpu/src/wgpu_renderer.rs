@@ -2695,6 +2695,8 @@ mod tests {
             border_color: color,
             corner_radii: Corners::default(),
             border_widths: Edges::default(),
+            corner_smoothing: 2.0,
+            pad: [0; 3],
         }
     }
 
