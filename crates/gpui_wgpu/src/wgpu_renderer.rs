@@ -1765,17 +1765,14 @@ impl WgpuRendererCore {
             };
             let instances =
                 self.write_instance_binding("surfaces_bind_group", instance_offset, &[params])?;
-            let texture = self
-                .create_texture_bind_group("surface_texture_bind_group", &surface.texture_view);
+            let texture =
+                self.create_texture_bind_group("surface_texture_bind_group", &surface.texture_view);
             let resources = self.resources();
             pass.set_pipeline(&resources.pipelines.surfaces);
             pass.set_bind_group(0, &resources.globals_bind_group, &[]);
             pass.set_bind_group(1, &instances.bind_group, &[]);
             pass.set_bind_group(2, &texture, &[]);
-            pass.draw(
-                0..4,
-                instances.first_instance..instances.first_instance + 1,
-            );
+            pass.draw(0..4, instances.first_instance..instances.first_instance + 1);
         }
         Ok(())
     }
@@ -2855,6 +2852,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 26 * 4);
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        assert_eq!(std::mem::size_of::<SurfaceParams>(), 14 * 4);
     }
 
     #[test]

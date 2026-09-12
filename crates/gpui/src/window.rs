@@ -1,32 +1,33 @@
-#[cfg(target_os = "windows")]
-use crate::DirectXDeviceContext;
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
+#[cfg(target_os = "windows")]
+use crate::DirectXDeviceContext;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
-#[cfg(feature = "profiler")]
-use crate::profiler;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use crate::WgpuDeviceContext;
+#[cfg(feature = "profiler")]
+use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GlyphRenderOptions, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollDelta, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowCornerMask, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GlyphRenderOptions, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent,
+    KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene,
+    ScrollDelta, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
+    TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowCornerMask,
+    WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -2861,7 +2862,9 @@ impl Window {
     /// During drawing this is a consistent frame snapshot. Outside drawing it
     /// reflects the latest platform sample, not a synchronous geometry query.
     pub fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
-        self.platform_window.visual_viewport_bounds().map(|length| length / self.zoom)
+        self.platform_window
+            .visual_viewport_bounds()
+            .map(|length| length / self.zoom)
     }
 
     /// Returns a conservative rectangle avoiding platform-known obscured content.
@@ -2869,7 +2872,11 @@ impl Window {
     /// Intersects the visual viewport with the full layout area inset by system
     /// safe areas and keyboard occlusion. Unknown overlays cannot be excluded.
     pub fn fully_visible_bounds(&self) -> Bounds<Pixels> {
-        let insets = self.platform_window.insets().effective().map(|length| length / self.zoom);
+        let insets = self
+            .platform_window
+            .insets()
+            .effective()
+            .map(|length| *length / self.zoom);
         let viewport = self.viewport_size();
         let left = insets.left.max(Pixels::ZERO).min(viewport.width);
         let top = insets.top.max(Pixels::ZERO).min(viewport.height);
@@ -5829,6 +5836,14 @@ impl Window {
             PlatformInput::Touch(event) => {
                 event.position = event.position / zoom;
                 event.predicted_position = event.predicted_position.map(|position| position / zoom);
+            }
+            PlatformInput::LongPress(event) => {
+                event.position = event.position / zoom;
+                event.start_position = event.start_position / zoom;
+            }
+            PlatformInput::TouchDrag(event) => {
+                event.position = event.position / zoom;
+                event.start_position = event.start_position / zoom;
             }
             PlatformInput::ScrollWheel(event) => {
                 event.position = event.position / zoom;
@@ -9861,6 +9876,85 @@ mod tests {
                     .size_full(),
                 )
         }
+    }
+
+    #[gpui::test]
+    fn zoom_converts_touch_predictions_and_visible_bounds(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let mut platform_window = cx.test_window(window.into());
+        platform_window.simulate_resize(size(px(400.), px(800.)));
+        platform_window.simulate_visual_viewport_change(Bounds::new(
+            point(px(10.), px(40.)),
+            size(px(380.), px(460.)),
+        ));
+        platform_window.simulate_insets_change(crate::WindowInsets {
+            safe_area: crate::Edges {
+                top: px(60.),
+                right: px(20.),
+                bottom: px(30.),
+                left: px(-10.),
+            },
+            ime: crate::Edges {
+                bottom: px(350.),
+                ..Default::default()
+            },
+        });
+
+        window
+            .update(cx, |_, window, _| {
+                for zoom in [0.5, 1., 2.] {
+                    window.set_zoom(zoom);
+                    assert_eq!(
+                        window.visual_viewport_bounds(),
+                        Bounds::new(point(px(10.), px(40.)), size(px(380.), px(460.)))
+                            .map(|length| length / zoom),
+                    );
+                    assert_eq!(
+                        window.fully_visible_bounds(),
+                        Bounds::new(point(px(10.), px(60.)), size(px(370.), px(390.)))
+                            .map(|length| length / zoom),
+                    );
+                    let PlatformInput::Touch(event) =
+                        window.unzoom_input(PlatformInput::Touch(TouchEvent {
+                            position: point(px(100.), px(120.)),
+                            predicted_position: Some(point(px(110.), px(140.))),
+                            ..Default::default()
+                        }))
+                    else {
+                        panic!("touch event changed kind");
+                    };
+                    assert_eq!(event.position, point(px(100.), px(120.)) / zoom);
+                    assert_eq!(
+                        event.predicted_position,
+                        Some(point(px(110.), px(140.)) / zoom),
+                    );
+                    for event in [
+                        PlatformInput::LongPress(LongPressEvent {
+                            start_position: point(px(100.), px(120.)),
+                            position: point(px(110.), px(140.)),
+                            phase: TouchPhase::Moved,
+                        }),
+                        PlatformInput::TouchDrag(TouchDragEvent {
+                            start_position: point(px(100.), px(120.)),
+                            position: point(px(110.), px(140.)),
+                            phase: TouchPhase::Moved,
+                        }),
+                    ] {
+                        let (start_position, position) = match window.unzoom_input(event) {
+                            PlatformInput::LongPress(event) => {
+                                (event.start_position, event.position)
+                            }
+                            PlatformInput::TouchDrag(event) => {
+                                (event.start_position, event.position)
+                            }
+                            _ => panic!("gesture changed kind"),
+                        };
+                        assert_eq!(start_position, point(px(100.), px(120.)) / zoom);
+                        assert_eq!(position, point(px(110.), px(140.)) / zoom);
+                    }
+                }
+            })
+            .unwrap();
     }
 
     #[gpui::test]

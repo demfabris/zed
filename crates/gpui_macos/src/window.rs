@@ -60,7 +60,9 @@ use objc2_app_kit::{
     NSTrackingAreaOptions, NSView as Objc2NSView, NSWindow as Objc2NSWindow,
     NSWindowButton as Objc2NSWindowButton, NSWorkspace,
 };
-use objc2_foundation::{NSPoint as Objc2NSPoint, NSRect as Objc2NSRect, NSSize as Objc2NSSize, NSURL};
+use objc2_foundation::{
+    NSPoint as Objc2NSPoint, NSRect as Objc2NSRect, NSSize as Objc2NSSize, NSURL,
+};
 use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
@@ -772,8 +774,7 @@ impl MacWindowState {
                         let () = msg_send![class!(CATransaction), begin];
                         let () = msg_send![class!(CATransaction), setDisableActions: YES];
                         for (index, button) in button_views.iter().enumerate() {
-                            let button_id =
-                                Retained::as_ptr(*button).cast::<Object>().cast_mut();
+                            let button_id = Retained::as_ptr(*button).cast::<Object>().cast_mut();
                             let layer: id = msg_send![button_id, layer];
                             if layer.is_null() {
                                 continue;
