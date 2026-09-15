@@ -1,9 +1,9 @@
 use crate::{
-    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle,
+    CornerRadiusMode, CursorStyle, DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font,
+    FontFeatures, FontStyle, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla,
+    JustifyContent, Length, SharedString, StrikethroughStyle, StyleRefinement, TextAlign,
+    TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -32,6 +32,18 @@ pub trait Styled: Sized {
     gpui_macros::cursor_style_methods!();
     gpui_macros::border_style_methods!();
     gpui_macros::box_shadow_style_methods!();
+
+    #[doc = "Set this element's corner radius policy without changing its children."]
+    fn corner_radius_mode(mut self, mode: CornerRadiusMode) -> Self {
+        self.style().corner_radius_mode = Some(mode);
+        self
+    }
+
+    #[doc = "Override corner smoothing for this element's fill, border and shadows only."]
+    fn corner_smoothing(mut self, smoothing: f32) -> Self {
+        self.style().corner_smoothing = Some(smoothing);
+        self
+    }
 
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)
