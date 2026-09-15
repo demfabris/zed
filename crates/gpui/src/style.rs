@@ -174,6 +174,16 @@ pub struct GridTemplate {
     pub min_size: GridTemplateMinSize,
 }
 
+#[doc = "How an element resolves its requested corner radii against its bounds."]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum CornerRadiusMode {
+    #[default]
+    #[doc = "Use the window's adaptive corner policy."]
+    Inherit,
+    #[doc = "Keep the requested radii, clamped to half the element's smaller dimension."]
+    Fixed,
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -287,6 +297,12 @@ pub struct Style {
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
+
+    #[doc = "How this element resolves its requested corner radii."]
+    pub corner_radius_mode: CornerRadiusMode,
+
+    #[doc = "Override the window's corner smoothing for this element's fill, border and shadows."]
+    pub corner_smoothing: Option<f32>,
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
@@ -708,12 +724,19 @@ impl Style {
         // repeating it. Fill, border and both shadow passes below share the
         // result, which is what keeps them tracing the same curve.
         let requested_radii = self.corner_radii.to_pixels(rem_size);
-        let corner_radii = match window.adaptive_corner_fraction() {
-            Some(fraction) => requested_radii.resolve_radii_for_quad_size(bounds.size, fraction),
-            None => requested_radii.clamp_radii_for_quad_size(bounds.size),
+        let corner_radii = match (self.corner_radius_mode, window.adaptive_corner_fraction()) {
+            (CornerRadiusMode::Inherit, Some(fraction)) => {
+                requested_radii.resolve_radii_for_quad_size(bounds.size, fraction)
+            }
+            _ => requested_radii.clamp_radii_for_quad_size(bounds.size),
         };
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows_with_smoothing(
+            bounds,
+            corner_radii,
+            &self.box_shadow,
+            self.corner_smoothing,
+        );
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -732,17 +755,24 @@ impl Style {
                 None => Hsla::default(),
             };
             border_color.a = 0.;
-            window.paint_quad(quad(
+            let mut background_quad = quad(
                 bounds,
                 corner_radii,
                 background_color.unwrap_or_default(),
                 Edges::default(),
                 border_color,
                 self.border_style,
-            ));
+            );
+            background_quad.corner_smoothing = self.corner_smoothing;
+            window.paint_quad(background_quad);
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_inset_shadows_with_smoothing(
+            bounds,
+            corner_radii,
+            &self.box_shadow,
+            self.corner_smoothing,
+        );
 
         continuation(window, cx);
 
@@ -750,14 +780,16 @@ impl Style {
             let border_widths = self.border_widths.to_pixels(rem_size);
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
-            window.paint_quad(quad(
+            let mut border_quad = quad(
                 bounds,
                 corner_radii,
                 background,
                 border_widths,
                 self.border_color.unwrap_or_default(),
                 self.border_style,
-            ));
+            );
+            border_quad.corner_smoothing = self.corner_smoothing;
+            window.paint_quad(border_quad);
         }
 
         #[cfg(debug_assertions)]
@@ -810,6 +842,8 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            corner_radius_mode: CornerRadiusMode::default(),
+            corner_smoothing: None,
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

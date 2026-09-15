@@ -4478,6 +4478,16 @@ impl Window {
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
     ) {
+        self.paint_drop_shadows_with_smoothing(bounds, corner_radii, shadows, None);
+    }
+
+    pub(crate) fn paint_drop_shadows_with_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        corner_smoothing: Option<f32>,
+    ) {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
@@ -4512,7 +4522,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                corner_smoothing: self.default_corner_smoothing,
+                corner_smoothing: corner_smoothing.unwrap_or(self.default_corner_smoothing),
             });
         }
     }
@@ -4525,6 +4535,16 @@ impl Window {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         shadows: &[BoxShadow],
+    ) {
+        self.paint_inset_shadows_with_smoothing(bounds, corner_radii, shadows, None);
+    }
+
+    pub(crate) fn paint_inset_shadows_with_smoothing(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+        corner_smoothing: Option<f32>,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -4557,7 +4577,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                corner_smoothing: self.default_corner_smoothing,
+                corner_smoothing: corner_smoothing.unwrap_or(self.default_corner_smoothing),
             });
         }
     }
@@ -7988,6 +8008,145 @@ mod tests {
     };
 
     use super::window_corner_mask_for_viewport;
+
+    #[gpui::test]
+    fn element_corner_radius_mode_preserves_fixed_radii(cx: &mut TestAppContext) {
+        struct CornerPolicyView;
+
+        impl Render for CornerPolicyView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().flex().flex_col().children(
+                    [
+                        (crate::CornerRadiusMode::Fixed, 8.0),
+                        (crate::CornerRadiusMode::Fixed, 10.0),
+                        (crate::CornerRadiusMode::Fixed, 200.0),
+                        (crate::CornerRadiusMode::Inherit, 10.0),
+                    ]
+                    .into_iter()
+                    .map(|(mode, radius)| {
+                        div()
+                            .w(px(100.0))
+                            .h(px(26.0))
+                            .flex_shrink_0()
+                            .rounded(px(radius))
+                            .corner_radius_mode(mode)
+                            .bg(crate::red())
+                    }),
+                )
+            }
+        }
+
+        let window = cx.add_window(|_, _| CornerPolicyView);
+        for fraction in [Some(0.45), None] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.set_adaptive_corner_fraction(fraction);
+                window.draw(cx).clear(cx);
+                let scale = window.scale_factor();
+                let radii: Vec<_> = window
+                    .rendered_frame
+                    .scene
+                    .quads
+                    .iter()
+                    .map(|quad| quad.corner_radii.top_left.0 / scale)
+                    .collect();
+                let inherited = fraction.map_or(10.0, |fraction| {
+                    let cap = 26.0 * fraction;
+                    cap * (10.0 / cap).tanh()
+                });
+                assert_eq!(radii.len(), 4);
+                for (actual, expected) in radii.iter().zip([8.0, 10.0, 13.0, inherited]) {
+                    assert!((actual - expected).abs() < 0.001);
+                }
+            })
+            .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn element_corner_smoothing_applies_to_own_quads_and_shadows(cx: &mut TestAppContext) {
+        struct CornerSmoothingView;
+
+        impl Render for CornerSmoothingView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let surface = |color| {
+                    div()
+                        .w(px(100.0))
+                        .h(px(26.0))
+                        .flex_shrink_0()
+                        .rounded(px(10.0))
+                        .bg(color)
+                        .border_1()
+                        .border_color(color)
+                        .shadow(vec![
+                            crate::BoxShadow {
+                                color,
+                                blur_radius: px(2.0),
+                                spread_radius: px(0.0),
+                                offset: point(px(0.0), px(0.0)),
+                                inset: false,
+                            },
+                            crate::BoxShadow {
+                                color,
+                                blur_radius: px(2.0),
+                                inset: true,
+                                spread_radius: px(0.0),
+                                offset: point(px(0.0), px(0.0)),
+                            },
+                        ])
+                };
+                div().flex().flex_col().children([
+                    surface(crate::red())
+                        .h(px(52.0))
+                        .corner_radius_mode(crate::CornerRadiusMode::Fixed)
+                        .corner_smoothing(2.0)
+                        .child(surface(crate::blue())),
+                    surface(crate::green()),
+                ])
+            }
+        }
+
+        let window = cx.add_window(|_, _| CornerSmoothingView);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.set_adaptive_corner_fraction(Some(0.45));
+            window.set_default_corner_smoothing(4.0);
+            window.draw(cx).clear(cx);
+            let scene = &window.rendered_frame.scene;
+            let scale = window.scale_factor();
+            for (color, smoothing, radius) in [
+                (crate::red(), 2.0, 10.0),
+                (crate::blue(), 4.0, 11.7 * (10.0_f32 / 11.7).tanh()),
+                (crate::green(), 4.0, 11.7 * (10.0_f32 / 11.7).tanh()),
+            ] {
+                let quads: Vec<_> = scene
+                    .quads
+                    .iter()
+                    .filter(|quad| quad.background.solid == color || quad.border_color == color)
+                    .collect();
+                assert!(quads.iter().any(|quad| quad.background.solid == color));
+                assert!(quads.iter().any(|quad| quad.border_color == color));
+                for quad in quads {
+                    assert_eq!(quad.corner_smoothing, smoothing);
+                    assert!((quad.corner_radii.top_left.0 / scale - radius).abs() < 0.001);
+                }
+                let shadows: Vec<_> = scene
+                    .shadows
+                    .iter()
+                    .filter(|shadow| shadow.color == color)
+                    .collect();
+                assert_eq!(shadows.len(), 2);
+                assert!(shadows.iter().any(|shadow| shadow.inset == 0));
+                assert!(shadows.iter().any(|shadow| shadow.inset == 1));
+                for shadow in shadows {
+                    assert_eq!(shadow.corner_smoothing, smoothing);
+                    assert!((shadow.corner_radii.top_left.0 / scale - radius).abs() < 0.001);
+                    assert_eq!(shadow.corner_radii, shadow.element_corner_radii);
+                }
+            }
+            assert_eq!(window.default_corner_smoothing, 4.0);
+            assert_eq!(window.adaptive_corner_fraction(), Some(0.45));
+        })
+        .unwrap();
+    }
 
     /// Visibility transitions reach observers exactly once each, with the new
     /// state already stored on the window, and never wake the platform for a
