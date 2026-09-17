@@ -2629,6 +2629,16 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
 }
 
 extern "C" fn handle_key_equivalent(this: &Object, _: Sel, native_event: id) -> BOOL {
+    unsafe {
+        let app = NSApplication::sharedApplication(nil);
+        let window_menu: id = msg_send![app, windowsMenu];
+        if window_menu != nil {
+            let handled: BOOL = msg_send![window_menu, performKeyEquivalent: native_event];
+            if handled == YES {
+                return YES;
+            }
+        }
+    }
     handle_key_event(this, native_event, true)
 }
 
