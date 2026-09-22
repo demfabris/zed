@@ -442,8 +442,16 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
+        Self::instance_with_backends(display, wgpu::Backends::VULKAN | wgpu::Backends::GL)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn instance_with_backends(
+        display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>,
+        backends: wgpu::Backends,
+    ) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             flags: Self::instance_flags(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -738,7 +746,7 @@ impl WgpuContext {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
+pub(crate) fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
     let mut id = id.trim();
 
     if id.starts_with("0x") || id.starts_with("0X") {
