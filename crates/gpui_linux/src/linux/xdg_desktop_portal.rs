@@ -16,6 +16,7 @@ pub enum Event {
     #[cfg_attr(feature = "x11", allow(dead_code))]
     CursorSize(u32),
     ButtonLayout(String),
+    SystemFont(Vec<String>),
 }
 
 pub struct XDPEventSource {
@@ -36,6 +37,12 @@ impl XDPEventSource {
                     sender.send(Event::WindowAppearance(
                         window_appearance_from_color_scheme(initial_appearance),
                     ))?;
+                }
+                for (namespace, key, parse) in SYSTEM_FONT_SETTINGS {
+                    if let Ok(font) = settings.read::<String>(namespace, key).await {
+                        sender.send(Event::SystemFont(parse(&font)))?;
+                        break;
+                    }
                 }
                 if let Ok(initial_theme) = settings
                     .read::<String>("org.gnome.desktop.interface", "cursor-theme")
@@ -116,6 +123,23 @@ impl XDPEventSource {
                         .detach();
                 }
 
+                for (namespace, key, parse) in SYSTEM_FONT_SETTINGS {
+                    if let Ok(mut font_changed) = settings
+                        .receive_setting_changed_with_args::<String>(namespace, key)
+                        .await
+                    {
+                        let sender = sender.clone();
+                        background
+                            .spawn(async move {
+                                while let Some(font) = font_changed.next().await {
+                                    sender.send(Event::SystemFont(parse(&font?)))?;
+                                }
+                                anyhow::Ok(())
+                            })
+                            .detach();
+                    }
+                }
+
                 let mut appearance_changed = settings.receive_color_scheme_changed().await?;
                 while let Some(scheme) = appearance_changed.next().await {
                     sender.send(Event::WindowAppearance(
@@ -182,10 +206,86 @@ impl EventSource for XDPEventSource {
     }
 }
 
+type FontSettingParser = fn(&str) -> Vec<String>;
+
+const SYSTEM_FONT_SETTINGS: [(&str, &str, FontSettingParser); 2] = [
+    (
+        "org.gnome.desktop.interface",
+        "font-name",
+        pango_font_families,
+    ),
+    ("org.kde.kdeglobals.General", "font", qt_font_families),
+];
+
+/// Candidate families for a Pango description such as `Ubuntu Sans Bold 11`,
+/// longest first, since style words and the family share one space-separated list.
+fn pango_font_families(description: &str) -> Vec<String> {
+    let mut families = description.split(',').map(str::trim).collect::<Vec<_>>();
+    let Some(last) = families.pop() else {
+        return Vec::new();
+    };
+    let mut words = last.split_whitespace().collect::<Vec<_>>();
+    if words
+        .last()
+        .is_some_and(|size| size.trim_end_matches("px").parse::<f32>().is_ok())
+    {
+        words.pop();
+    }
+    let mut candidates = families
+        .into_iter()
+        .filter(|family| !family.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    candidates.extend((1..=words.len()).rev().map(|len| words[..len].join(" ")));
+    candidates
+}
+
+/// The family of a Qt font string such as `Noto Sans,10,-1,5,50,0,0,0,0,0`.
+fn qt_font_families(description: &str) -> Vec<String> {
+    description
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .map(|family| vec![family.to_owned()])
+        .unwrap_or_default()
+}
+
 fn window_appearance_from_color_scheme(cs: ColorScheme) -> WindowAppearance {
     match cs {
         ColorScheme::PreferDark => WindowAppearance::Dark,
         ColorScheme::PreferLight => WindowAppearance::Light,
         ColorScheme::NoPreference => WindowAppearance::Light,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pango_descriptions_offer_the_family_before_style_and_size() {
+        assert_eq!(
+            pango_font_families("Ubuntu Sans 11"),
+            ["Ubuntu Sans", "Ubuntu"]
+        );
+        assert_eq!(
+            pango_font_families("Noto Sans Bold 10.5"),
+            ["Noto Sans Bold", "Noto Sans", "Noto"]
+        );
+        assert_eq!(
+            pango_font_families("Cantarell, Noto Sans 11"),
+            ["Cantarell", "Noto Sans", "Noto"]
+        );
+        assert!(pango_font_families("").is_empty());
+    }
+
+    #[test]
+    fn qt_font_strings_offer_their_family() {
+        assert_eq!(
+            qt_font_families("Noto Sans,10,-1,5,50,0,0,0,0,0"),
+            ["Noto Sans"]
+        );
+        assert!(qt_font_families(",10").is_empty());
     }
 }

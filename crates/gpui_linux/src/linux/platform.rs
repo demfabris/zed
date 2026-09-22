@@ -140,6 +140,8 @@ pub(crate) struct LinuxCommon {
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
     pub(crate) text_system: Arc<dyn PlatformTextSystem>,
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    pub(crate) cosmic_text_system: Arc<crate::linux::CosmicTextSystem>,
     pub(crate) appearance: WindowAppearance,
     pub(crate) auto_hide_scrollbars: bool,
     pub(crate) button_layout: WindowButtonLayout,
@@ -168,7 +170,9 @@ impl LinuxCommon {
         let (power_sender, power_receiver) = calloop::channel::channel();
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
-        let text_system = Arc::new(crate::linux::CosmicTextSystem::new("IBM Plex Sans"));
+        let cosmic_text_system = Arc::new(crate::linux::CosmicTextSystem::new("IBM Plex Sans"));
+        #[cfg(any(feature = "wayland", feature = "x11"))]
+        let text_system: Arc<dyn PlatformTextSystem> = cosmic_text_system.clone();
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
         let text_system = Arc::new(gpui::NoopTextSystem::new());
 
@@ -182,6 +186,8 @@ impl LinuxCommon {
             background_executor,
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system,
+            #[cfg(any(feature = "wayland", feature = "x11"))]
+            cosmic_text_system,
             appearance: WindowAppearance::Light,
             auto_hide_scrollbars: false,
             button_layout: WindowButtonLayout::linux_default(),

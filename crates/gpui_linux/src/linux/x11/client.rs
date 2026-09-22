@@ -521,6 +521,17 @@ impl X11Client {
                     XDPEvent::CursorTheme(_) | XDPEvent::CursorSize(_) => {
                         // noop, X11 manages this for us.
                     }
+                    XDPEvent::SystemFont(families) => {
+                        if client.with_common(|common| {
+                            common
+                                .cosmic_text_system
+                                .set_system_font_family(families.iter().map(String::as_str))
+                        }) {
+                            for window in client.0.borrow().windows.values() {
+                                window.window.state.borrow_mut().force_render_after_recovery = true;
+                            }
+                        }
+                    }
                 }
             })
             .map_err(|err| anyhow!("Failed to initialize XDP event source: {err:?}"))?;
