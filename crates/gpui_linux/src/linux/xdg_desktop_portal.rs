@@ -6,6 +6,7 @@ use ashpd::desktop::settings::{ColorScheme, Settings};
 use calloop::channel::Channel;
 use calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
 use smol::stream::StreamExt;
+use std::time::Duration;
 
 use gpui::{BackgroundExecutor, WindowAppearance};
 
@@ -204,6 +205,31 @@ impl EventSource for XDPEventSource {
 
         Ok(())
     }
+}
+
+/// Reads the desktop interface font before any text is shaped, so windows
+/// never draw their first frames in a fallback family. Later changes arrive
+/// through [`XDPEventSource`].
+#[allow(
+    clippy::disallowed_methods,
+    reason = "runs while the platform is constructed, before any GPUI executor can drive a timer"
+)]
+pub(crate) fn read_system_font(timeout: Duration) -> Option<Vec<String>> {
+    smol::block_on(smol::future::or(
+        async {
+            let settings = Settings::new().await.ok()?;
+            for (namespace, key, parse) in SYSTEM_FONT_SETTINGS {
+                if let Ok(font) = settings.read::<String>(namespace, key).await {
+                    return Some(parse(&font));
+                }
+            }
+            None
+        },
+        async {
+            smol::Timer::after(timeout).await;
+            None
+        },
+    ))
 }
 
 type FontSettingParser = fn(&str) -> Vec<String>;
