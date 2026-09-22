@@ -19,8 +19,8 @@ use smallvec::SmallVec;
 
 use crate::{
     Axis, GestureEvent, InputEvent, IsZero, Modifiers, MouseButton, MouseDownEvent, MouseEvent,
-    MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId,
-    TouchPhase, point, px, seal::Sealed,
+    MouseUpEvent, Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, Size, TouchEvent,
+    TouchId, TouchPhase, point, px, seal::Sealed,
 };
 
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
@@ -49,6 +49,10 @@ fn movements_oppose(left: Point<Pixels>, right: Point<Pixels>) -> bool {
 pub struct OngoingScroll {
     last_event: Option<Instant>,
     axis: Option<Axis>,
+    band_x: RubberBand,
+    band_y: RubberBand,
+    range: Point<Pixels>,
+    extent: Size<Pixels>,
 }
 
 impl OngoingScroll {
@@ -105,6 +109,241 @@ impl OngoingScroll {
             lock_delta_to_axis(delta, axis);
         }
     }
+
+    pub(crate) fn set_bounds(&mut self, range: Point<Pixels>, extent: Size<Pixels>) {
+        self.range = range;
+        self.extent = extent;
+    }
+
+    pub(crate) fn bounce(
+        &mut self,
+        offset: &mut Point<Pixels>,
+        delta: Point<Pixels>,
+        phase: TouchPhase,
+    ) {
+        offset.x = self.band_x.scroll(
+            offset.x,
+            delta.x,
+            -self.range.x,
+            Pixels::ZERO,
+            self.extent.width,
+            phase,
+        );
+        offset.y = self.band_y.scroll(
+            offset.y,
+            delta.y,
+            -self.range.y,
+            Pixels::ZERO,
+            self.extent.height,
+            phase,
+        );
+    }
+
+    pub(crate) fn displacement(&mut self) -> Point<Pixels> {
+        point(
+            self.band_x.displacement(self.extent.width),
+            self.band_y.displacement(self.extent.height),
+        )
+    }
+
+    pub(crate) fn is_stretched(&self) -> bool {
+        self.band_x.is_stretched() || self.band_y.is_stretched()
+    }
+
+    pub(crate) fn is_animating(&self) -> bool {
+        self.band_x.is_animating() || self.band_y.is_animating()
+    }
+}
+
+const RUBBER_BAND_COEFFICIENT: f32 = 0.55;
+const BOUNCE_STIFFNESS: f32 = 13.;
+const BOUNCE_REST: f32 = 0.5;
+const COAST_GAP: Duration = Duration::from_millis(100);
+const MAX_BOUNCE_STEP: Duration = Duration::from_millis(33);
+const MIN_BOUNCE_STEP: Duration = Duration::from_millis(4);
+
+/// Overscroll state for one scroll axis under [`Overscroll::Bounce`]: how
+/// far a held gesture has stretched past the content edge, and the spring
+/// that brings the content back once the gesture lets go or a fling runs
+/// into the edge.
+///
+/// Scroll offsets follow GPUI's convention: `0` at the start of the content
+/// and negative further in. The container keeps its stored offset inside its
+/// range and draws [`Self::displacement`] on top of it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RubberBand {
+    phase: BandPhase,
+    stretch: f32,
+    spring: Option<Spring>,
+    last_event: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BandPhase {
+    #[default]
+    Idle,
+    Held,
+    Coasting,
+    Bounced,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Spring {
+    start: Instant,
+    from: f32,
+    velocity: f32,
+}
+
+impl Spring {
+    fn at(&self, now: Instant) -> Option<f32> {
+        let t = now.duration_since(self.start).as_secs_f32();
+        let position = (self.from + (self.velocity + BOUNCE_STIFFNESS * self.from) * t)
+            * (-BOUNCE_STIFFNESS * t).exp();
+        (t < 1. / BOUNCE_STIFFNESS || position.abs() >= BOUNCE_REST).then_some(position)
+    }
+}
+
+fn rubber_band(stretch: f32, extent: f32) -> f32 {
+    if extent <= 0. {
+        return 0.;
+    }
+    let pulled = (1. - 1. / (stretch.abs() * RUBBER_BAND_COEFFICIENT / extent + 1.)) * extent;
+    pulled.copysign(stretch)
+}
+
+fn unrubber_band(displacement: f32, extent: f32) -> f32 {
+    if extent <= 0. {
+        return 0.;
+    }
+    let pulled = displacement.abs().min(extent * 0.99);
+    (pulled / (RUBBER_BAND_COEFFICIENT * (1. - pulled / extent))).copysign(displacement)
+}
+
+impl RubberBand {
+    /// Applies one scroll step to `offset`, which stays inside
+    /// `min..=max`, and returns the new offset. While the gesture is held,
+    /// travel past the range stretches the band instead; a release springs
+    /// it back, and post-release momentum that reaches the edge bounces off
+    /// it. Steps outside a phased gesture, like mouse wheel ticks, clamp.
+    /// `extent` is the viewport length along this axis.
+    pub fn scroll(
+        &mut self,
+        offset: Pixels,
+        delta: Pixels,
+        min: Pixels,
+        max: Pixels,
+        extent: Pixels,
+        phase: TouchPhase,
+    ) -> Pixels {
+        self.scroll_at(offset, delta, min, max, extent, phase, Instant::now())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scroll_at(
+        &mut self,
+        offset: Pixels,
+        delta: Pixels,
+        min: Pixels,
+        max: Pixels,
+        extent: Pixels,
+        phase: TouchPhase,
+        now: Instant,
+    ) -> Pixels {
+        let (offset, delta, min, max, extent) = (
+            f32::from(offset),
+            f32::from(delta),
+            f32::from(min),
+            f32::from(max).max(f32::from(min)),
+            f32::from(extent),
+        );
+        let gap = self.last_event.map(|last| now.duration_since(last));
+        self.last_event = Some(now);
+        if matches!(self.phase, BandPhase::Coasting | BandPhase::Bounced)
+            && gap.is_none_or(|gap| gap > COAST_GAP)
+        {
+            self.phase = BandPhase::Idle;
+        }
+        if phase == TouchPhase::Started {
+            self.stretch = self
+                .spring
+                .take()
+                .and_then(|spring| spring.at(now))
+                .map_or(0., |displacement| unrubber_band(displacement, extent));
+            self.phase = BandPhase::Held;
+        }
+        let bounces = max > min;
+        let next = match self.phase {
+            BandPhase::Held if bounces => {
+                let raw = offset + self.stretch + delta;
+                let next = raw.clamp(min, max);
+                self.stretch = raw - next;
+                next
+            }
+            BandPhase::Coasting if bounces => {
+                let raw = offset + delta;
+                let next = raw.clamp(min, max);
+                if raw != next {
+                    let step = gap
+                        .unwrap_or(MAX_BOUNCE_STEP)
+                        .clamp(MIN_BOUNCE_STEP, MAX_BOUNCE_STEP)
+                        .as_secs_f32();
+                    self.spring = Some(Spring {
+                        start: now,
+                        from: 0.,
+                        velocity: delta / step,
+                    });
+                    self.phase = BandPhase::Bounced;
+                }
+                next
+            }
+            BandPhase::Bounced => offset,
+            _ => (offset + delta).clamp(min, max),
+        };
+        if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            if self.phase == BandPhase::Held {
+                let from = rubber_band(mem::take(&mut self.stretch), extent);
+                self.phase = if from == 0. {
+                    BandPhase::Coasting
+                } else {
+                    self.spring = Some(Spring {
+                        start: now,
+                        from,
+                        velocity: 0.,
+                    });
+                    BandPhase::Bounced
+                };
+            } else {
+                self.phase = BandPhase::Idle;
+            }
+        }
+        px(next)
+    }
+
+    /// How far past its range the content should be drawn, given the
+    /// viewport length along this axis.
+    pub fn displacement(&mut self, extent: Pixels) -> Pixels {
+        self.displacement_at(extent, Instant::now())
+    }
+
+    fn displacement_at(&mut self, extent: Pixels, now: Instant) -> Pixels {
+        if let Some(spring) = self.spring {
+            match spring.at(now) {
+                Some(position) => return px(position),
+                None => self.spring = None,
+            }
+        }
+        px(rubber_band(self.stretch, f32::from(extent)))
+    }
+
+    /// Whether the band is springing back and needs another frame.
+    pub fn is_animating(&self) -> bool {
+        self.spring.is_some()
+    }
+
+    /// Whether the content is drawn past its range, or about to be.
+    pub fn is_stretched(&self) -> bool {
+        self.spring.is_some() || self.stretch != 0.
+    }
 }
 
 /// Feel constants consumed by gesture recognizers. Provided on a best-effort
@@ -127,6 +366,20 @@ pub struct GestureTuning {
     /// Minimum release velocity, in pixels per second, required to start
     /// scroll momentum.
     pub min_fling_velocity: f32,
+    /// What scroll containers do when a touch or trackpad scroll runs past
+    /// their content.
+    pub overscroll: Overscroll,
+}
+
+/// Boundary behavior of scroll containers under touch and trackpad scrolls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Overscroll {
+    /// Stop at the content edge.
+    #[default]
+    Clamp,
+    /// Stretch past the edge with growing resistance and spring back once
+    /// the gesture lets go, the `UIScrollView` model.
+    Bounce,
 }
 
 impl Default for GestureTuning {
@@ -138,6 +391,7 @@ impl Default for GestureTuning {
             long_press_duration: Duration::from_millis(500),
             scroll_physics: ScrollPhysics::ios(),
             min_fling_velocity: 50.,
+            overscroll: Overscroll::Clamp,
         }
     }
 }
@@ -958,6 +1212,10 @@ impl TouchGestureRecognizer {
         };
     }
 
+    pub(crate) fn tuning(&self) -> GestureTuning {
+        self.tuning
+    }
+
     pub(crate) fn has_momentum(&self) -> bool {
         self.momentum.is_some()
     }
@@ -1120,6 +1378,108 @@ fn quadratic_velocity_at_newest(times: &[f64], values: &[f64]) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::point;
+
+    const EXTENT: Pixels = px(800.);
+
+    fn band_step(
+        band: &mut RubberBand,
+        offset: Pixels,
+        delta: f32,
+        phase: TouchPhase,
+        now: Instant,
+    ) -> Pixels {
+        band.scroll_at(offset, px(delta), px(-1000.), px(0.), EXTENT, phase, now)
+    }
+
+    #[test]
+    fn held_pull_past_the_edge_stretches_with_resistance_and_springs_back() {
+        let start = Instant::now();
+        let mut band = RubberBand::default();
+        let mut offset = band_step(&mut band, px(-20.), 0., TouchPhase::Started, start);
+        for frame in 1..=10 {
+            let now = start + Duration::from_millis(frame * 8);
+            offset = band_step(&mut band, offset, 20., TouchPhase::Moved, now);
+        }
+        assert_eq!(offset, px(0.));
+        let stretched = band.displacement_at(EXTENT, start + Duration::from_millis(80));
+        assert!(stretched > px(0.) && stretched < px(180.), "{stretched:?}");
+
+        let release = start + Duration::from_millis(88);
+        offset = band_step(&mut band, offset, 0., TouchPhase::Ended, release);
+        assert_eq!(offset, px(0.));
+        assert!(band.is_animating());
+        let settling = band.displacement_at(EXTENT, release + Duration::from_millis(100));
+        assert!(settling > px(0.) && settling < stretched);
+        assert_eq!(
+            band.displacement_at(EXTENT, release + Duration::from_secs(2)),
+            px(0.)
+        );
+        assert!(!band.is_stretched());
+    }
+
+    #[test]
+    fn fling_into_the_edge_bounces_once() {
+        let start = Instant::now();
+        let mut band = RubberBand::default();
+        let mut offset = band_step(&mut band, px(-900.), 0., TouchPhase::Started, start);
+        offset = band_step(&mut band, offset, -40., TouchPhase::Moved, start);
+        offset = band_step(&mut band, offset, 0., TouchPhase::Ended, start);
+        let mut now = start;
+        let mut peak = px(0.);
+        for _ in 0..60 {
+            now += Duration::from_millis(16);
+            offset = band_step(&mut band, offset, -30., TouchPhase::Moved, now);
+            peak = peak.min(band.displacement_at(EXTENT, now));
+        }
+        assert_eq!(offset, px(-1000.));
+        assert!(peak < px(-10.) && peak > px(-200.), "{peak:?}");
+        band_step(&mut band, offset, 0., TouchPhase::Ended, now);
+        assert_eq!(
+            band.displacement_at(EXTENT, now + Duration::from_secs(2)),
+            px(0.)
+        );
+    }
+
+    #[test]
+    fn wheel_steps_and_fitting_content_clamp() {
+        let now = Instant::now();
+        let mut band = RubberBand::default();
+        assert_eq!(
+            band_step(&mut band, px(-5.), 40., TouchPhase::Moved, now),
+            px(0.)
+        );
+        assert!(!band.is_stretched());
+
+        let mut fitting = RubberBand::default();
+        fitting.scroll_at(
+            px(0.),
+            px(0.),
+            px(0.),
+            px(0.),
+            EXTENT,
+            TouchPhase::Started,
+            now,
+        );
+        let offset = fitting.scroll_at(
+            px(0.),
+            px(60.),
+            px(0.),
+            px(0.),
+            EXTENT,
+            TouchPhase::Moved,
+            now,
+        );
+        assert_eq!(offset, px(0.));
+        assert!(!fitting.is_stretched());
+    }
+
+    #[test]
+    fn rubber_band_inverts() {
+        for stretch in [-900., -40., 0., 3., 250.] {
+            let shown = rubber_band(stretch, 800.);
+            assert!((unrubber_band(shown, 800.) - stretch).abs() < 0.01);
+        }
+    }
 
     #[test]
     fn ongoing_scroll_locks_to_dominant_axis() {

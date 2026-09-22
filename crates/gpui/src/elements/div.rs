@@ -22,8 +22,8 @@ use crate::{
     InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
     KeyboardClickEvent, LayoutId, LongPressEvent, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
-    MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
+    MouseUpEvent, OngoingScroll, Overflow, Overscroll, ParentElement, PinchEvent, Pixels, Point,
+    Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
     TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
@@ -2485,7 +2485,18 @@ impl Interactivity {
                 scroll_handle_state.bounds = bounds;
             }
 
-            *scroll_offset
+            let mut offset = *scroll_offset;
+            if let Some(ongoing_scroll) = self.ongoing_scroll.as_ref() {
+                let mut ongoing_scroll = ongoing_scroll.borrow_mut();
+                ongoing_scroll.set_bounds(scroll_max, bounds.size);
+                if ongoing_scroll.is_stretched() {
+                    offset += ongoing_scroll.displacement();
+                    if ongoing_scroll.is_animating() {
+                        window.request_animation_frame();
+                    }
+                }
+            }
+            offset
         } else {
             Point::default()
         }
@@ -3337,6 +3348,7 @@ impl Interactivity {
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
             let line_height = window.line_height();
+            let bounce = window.gesture_tuning().overscroll == Overscroll::Bounce;
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -3353,7 +3365,6 @@ impl Interactivity {
                             .borrow_mut()
                             .filter(&mut delta, event.touch_phase);
                     }
-
                     let mut delta_x = match overflow.x {
                         Overflow::Scroll if !delta.x.is_zero() => delta.x,
                         Overflow::Scroll
@@ -3379,8 +3390,30 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    if bounce && let Some(ongoing_scroll) = &ongoing_scroll {
+                        let mut ongoing_scroll = ongoing_scroll.borrow_mut();
+                        let was_stretched = ongoing_scroll.is_stretched();
+                        let native = point(
+                            if overflow.x == Overflow::Scroll && !delta.x.is_zero() {
+                                delta_x
+                            } else {
+                                Pixels::ZERO
+                            },
+                            if overflow.y == Overflow::Scroll && !delta.y.is_zero() {
+                                delta_y
+                            } else {
+                                Pixels::ZERO
+                            },
+                        );
+                        *scroll_offset += point(delta_x, delta_y) - native;
+                        ongoing_scroll.bounce(&mut scroll_offset, native, event.touch_phase);
+                        if was_stretched || ongoing_scroll.is_stretched() {
+                            cx.notify(current_view);
+                        }
+                    } else {
+                        scroll_offset.y += delta_y;
+                        scroll_offset.x += delta_x;
+                    }
                     if *scroll_offset != old_scroll_offset {
                         cx.notify(current_view);
                     }

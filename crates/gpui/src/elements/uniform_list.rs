@@ -396,12 +396,13 @@ impl Element for UniformList {
                 if self.item_count > 0 {
                     let content_height = item_height * self.item_count;
 
-                    let is_scrolled_vertically = !scroll_offset.y.is_zero();
+                    let stored_offset = shared_scroll_offset.borrow().y;
+                    let is_scrolled_vertically = !stored_offset.is_zero();
                     let max_scroll_offset = padded_bounds.size.height - content_height;
 
-                    if is_scrolled_vertically && scroll_offset.y < max_scroll_offset {
+                    if is_scrolled_vertically && stored_offset < max_scroll_offset {
                         shared_scroll_offset.borrow_mut().y = max_scroll_offset;
-                        scroll_offset.y = max_scroll_offset;
+                        scroll_offset.y = max_scroll_offset + scroll_offset.y - stored_offset;
                     }
 
                     let content_width = content_size.width + padding.left + padding.right;

@@ -5991,6 +5991,11 @@ impl Window {
         }
     }
 
+    /// The platform's feel constants for touch gestures and scrolling.
+    pub fn gesture_tuning(&self) -> GestureTuning {
+        self.touch_gestures.tuning()
+    }
+
     /// Whether recognized touch pans may use the platform's predicted touch
     /// positions ([`TouchEvent::predicted_position`]) to compensate for input
     /// latency. Defaults to true.
