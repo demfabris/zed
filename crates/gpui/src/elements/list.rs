@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Overflow, Overscroll, Pixels, Point, RubberBand, ScrollDelta, ScrollWheelEvent, Size, Style,
+    StyleRefinement, Styled, TouchPhase, Window, point, px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -73,6 +73,7 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    overscroll: RubberBand,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,6 +326,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            overscroll: RubberBand::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -895,11 +897,13 @@ impl StateInner {
         scroll_top.item_ix..cursor.start().count + 1
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scroll(
         &mut self,
         scroll_top: &ListOffset,
         height: Pixels,
         delta: Point<Pixels>,
+        bounce: Option<TouchPhase>,
         current_view: EntityId,
         window: &mut Window,
         cx: &mut App,
@@ -913,9 +917,20 @@ impl StateInner {
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
-            .max(px(0.))
-            .min(scroll_max);
+        let new_scroll_top = match bounce {
+            Some(phase) => {
+                let current = self
+                    .logical_scroll_top
+                    .map_or_else(|| self.scroll_top(scroll_top), |top| self.scroll_top(&top))
+                    .min(scroll_max);
+                -self
+                    .overscroll
+                    .scroll(-current, delta.y, -scroll_max, px(0.), height, phase)
+            }
+            None => (self.scroll_top(scroll_top) - delta.y)
+                .max(px(0.))
+                .min(scroll_max),
+        };
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.pending_scroll = None;
@@ -1279,14 +1294,20 @@ impl StateInner {
 
             // Only paint the visible items, if there is actually any space for them (taking padding into account)
             if bounds.size.height > padding.top + padding.bottom {
+                let shift = Point::new(px(0.), self.overscroll.displacement(bounds.size.height));
+                if self.overscroll.is_animating() {
+                    window.request_animation_frame();
+                }
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
                 for item in &mut layout_response.item_layouts {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                        item.element.prepaint_at(item_origin, window, cx);
+                        item.element.prepaint_at(item_origin + shift, window, cx);
                     });
 
-                    if let Some(autoscroll_bounds) = window.take_autoscroll()
+                    if let Some(autoscroll_bounds) = window
+                        .take_autoscroll()
+                        .map(|bounds| Bounds::new(bounds.origin - shift, bounds.size))
                         && autoscroll
                     {
                         if autoscroll_bounds.top() < bounds.top() {
@@ -1597,15 +1618,21 @@ impl Element for List {
         let height = bounds.size.height;
         let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
+        let bounce = window.gesture_tuning().overscroll == Overscroll::Bounce;
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
+                let pixel_delta = if bounce {
+                    event.delta.pixel_delta(px(20.))
+                } else {
+                    accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
+                    accumulated_scroll_delta.pixel_delta(px(20.))
+                };
                 list_state.0.borrow_mut().scroll(
                     &scroll_top,
                     height,
                     pixel_delta,
+                    bounce.then_some(event.touch_phase),
                     current_view,
                     window,
                     cx,
