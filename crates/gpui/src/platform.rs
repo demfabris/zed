@@ -1238,6 +1238,12 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
+    /// Changes whenever the platform starts resolving a font name to a
+    /// different family, such as the system UI font following a desktop
+    /// setting. Font ids resolved under an older generation may be stale.
+    fn font_generation(&self) -> u64 {
+        0
+    }
     /// Get metrics for a font.
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
     /// Get typographic bounds for a glyph.

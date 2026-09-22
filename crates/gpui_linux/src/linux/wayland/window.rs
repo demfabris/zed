@@ -1044,7 +1044,7 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    fn request_redraw(&self) {
+    pub(crate) fn request_redraw(&self) {
         self.state.borrow_mut().redraw_requested = true;
         self.schedule_frame();
     }

@@ -287,7 +287,7 @@ pub struct X11WindowState {
     /// `VisibilityNotify`; this is the last value it reported.
     visibility: WindowVisibility,
     hovered: bool,
-    force_render_after_recovery: bool,
+    pub(crate) force_render_after_recovery: bool,
     fullscreen: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,

@@ -991,6 +991,24 @@ impl WaylandClient {
                             client.cursor.set_size(size);
                         }
                     }
+                    XDPEvent::SystemFont(families) => {
+                        if let Some(client) = client.0.upgrade() {
+                            let windows = {
+                                let client = client.borrow();
+                                if !client
+                                    .common
+                                    .cosmic_text_system
+                                    .set_system_font_family(families.iter().map(String::as_str))
+                                {
+                                    return;
+                                }
+                                client.windows.values().cloned().collect::<Vec<_>>()
+                            };
+                            for window in windows {
+                                window.request_redraw();
+                            }
+                        }
+                    }
                 }
             })
             .unwrap();

@@ -14,14 +14,21 @@ use gpui::{
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
+pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>, AtomicU64);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FontKey {
@@ -131,17 +138,20 @@ impl CosmicTextSystem {
     pub fn new(system_font_fallback: &str) -> Self {
         let font_system = FontSystem::new();
 
-        Self(RwLock::new(CosmicTextSystemState {
-            font_system,
-            scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
-            loaded_fonts: Vec::new(),
-            loaded_font_ids_by_key: HashMap::default(),
-            font_ids_by_family_cache: HashMap::default(),
-            system_font_fallback: system_font_fallback.to_string(),
-            missing_glyph_sink: None,
-        }))
+        Self(
+            RwLock::new(CosmicTextSystemState {
+                font_system,
+                scratch: ShapeBuffer::default(),
+                swash_scale_context: ScaleContext::new(),
+                pending_glyph_images: HashMap::default(),
+                loaded_fonts: Vec::new(),
+                loaded_font_ids_by_key: HashMap::default(),
+                font_ids_by_family_cache: HashMap::default(),
+                system_font_fallback: system_font_fallback.to_string(),
+                missing_glyph_sink: None,
+            }),
+            AtomicU64::new(0),
+        )
     }
 
     pub fn new_without_system_fonts(system_font_fallback: &str) -> Self {
@@ -150,21 +160,55 @@ impl CosmicTextSystem {
             cosmic_text::fontdb::Database::new(),
         );
 
-        Self(RwLock::new(CosmicTextSystemState {
-            font_system,
-            scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
-            loaded_fonts: Vec::new(),
-            loaded_font_ids_by_key: HashMap::default(),
-            font_ids_by_family_cache: HashMap::default(),
-            system_font_fallback: system_font_fallback.to_string(),
-            missing_glyph_sink: None,
-        }))
+        Self(
+            RwLock::new(CosmicTextSystemState {
+                font_system,
+                scratch: ShapeBuffer::default(),
+                swash_scale_context: ScaleContext::new(),
+                pending_glyph_images: HashMap::default(),
+                loaded_fonts: Vec::new(),
+                loaded_font_ids_by_key: HashMap::default(),
+                font_ids_by_family_cache: HashMap::default(),
+                system_font_fallback: system_font_fallback.to_string(),
+                missing_glyph_sink: None,
+            }),
+            AtomicU64::new(0),
+        )
+    }
+}
+
+impl CosmicTextSystem {
+    /// Resolves `.SystemUIFont` to the first installed family in `families`,
+    /// such as the desktop's interface font. Returns whether the mapping
+    /// changed.
+    pub fn set_system_font_family<'a>(&self, families: impl IntoIterator<Item = &'a str>) -> bool {
+        let mut state = self.0.write();
+        let Some(family) = families.into_iter().find_map(|candidate| {
+            state
+                .font_system
+                .db()
+                .faces()
+                .flat_map(|face| face.families.iter())
+                .find(|(name, _)| name.eq_ignore_ascii_case(candidate.trim()))
+                .map(|(name, _)| name.clone())
+        }) else {
+            return false;
+        };
+        if state.system_font_fallback == family {
+            return false;
+        }
+        state.system_font_fallback = family;
+        state.font_ids_by_family_cache.clear();
+        self.1.fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
 impl PlatformTextSystem for CosmicTextSystem {
+    fn font_generation(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
+
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.0.write().add_fonts(fonts)
     }
@@ -1256,6 +1300,29 @@ mod tests {
         let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
         text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
         Ok(text_system)
+    }
+
+    #[test]
+    fn system_ui_font_follows_the_desktop_family() -> Result<()> {
+        let platform = Arc::new(CosmicTextSystem::new_without_system_fonts("IBM Plex Sans"));
+        let text_system = gpui::TextSystem::new(platform.clone());
+        text_system.add_fonts(vec![
+            Cow::Borrowed(IBM_PLEX),
+            Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/lilex/Lilex-Regular.ttf"
+            )),
+        ])?;
+        let system = gpui::font(".SystemUIFont");
+        let plex = text_system.resolve_font(&system);
+
+        assert!(!platform.set_system_font_family(["Missing Sans", "ibm plex sans"]));
+        assert_eq!(text_system.resolve_font(&system), plex);
+
+        assert!(platform.set_system_font_family(["Missing Sans", "lilex"]));
+        let lilex = text_system.resolve_font(&system);
+        assert_ne!(lilex, plex);
+        assert_eq!(text_system.resolve_font(&system), lilex);
+        Ok(())
     }
 
     #[test]

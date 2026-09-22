@@ -32,7 +32,7 @@ use std::{
     ops::{Deref, DerefMut, Range},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -231,6 +231,7 @@ pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
     resolved_fonts: RwLock<FxHashMap<Font, FontId>>,
+    platform_font_generation: AtomicU64,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
@@ -252,6 +253,7 @@ impl TextSystem {
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
             resolved_fonts: RwLock::default(),
+            platform_font_generation: AtomicU64::new(0),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
             fallback_font_stack: smallvec![
@@ -330,6 +332,7 @@ impl TextSystem {
 
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
+        self.sync_font_generation();
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {
             match font_id {
                 Ok(font_id) => Ok(*font_id),
@@ -371,12 +374,26 @@ impl TextSystem {
     ///
     /// Panics if the font and none of the fallbacks can be resolved.
     pub fn resolve_font(&self, font: &Font) -> FontId {
+        self.sync_font_generation();
         if let Some(font_id) = self.resolved_fonts.read().get(font) {
             return *font_id;
         }
         let font_id = self.resolve_font_uncached(font);
         self.resolved_fonts.write().insert(font.clone(), font_id);
         font_id
+    }
+
+    fn sync_font_generation(&self) {
+        let generation = self.platform_text_system.font_generation();
+        if self
+            .platform_font_generation
+            .swap(generation, Ordering::Relaxed)
+            != generation
+        {
+            self.font_ids_by_font.write().clear();
+            self.resolved_fonts.write().clear();
+            self.font_generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     // Walking the fallback stack costs one failed lookup, and one formatted
