@@ -172,6 +172,12 @@ impl LinuxCommon {
         #[cfg(any(feature = "wayland", feature = "x11"))]
         let cosmic_text_system = Arc::new(crate::linux::CosmicTextSystem::new("IBM Plex Sans"));
         #[cfg(any(feature = "wayland", feature = "x11"))]
+        if let Some(families) =
+            crate::linux::xdg_desktop_portal::read_system_font(Duration::from_millis(200))
+        {
+            cosmic_text_system.set_system_font_family(families.iter().map(String::as_str));
+        }
+        #[cfg(any(feature = "wayland", feature = "x11"))]
         let text_system: Arc<dyn PlatformTextSystem> = cosmic_text_system.clone();
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
         let text_system = Arc::new(gpui::NoopTextSystem::new());
