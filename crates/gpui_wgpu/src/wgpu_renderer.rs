@@ -286,37 +286,22 @@ impl WgpuRenderer {
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            // Fall back to the display handle already provided via InstanceDescriptor::display.
-            raw_display_handle: None,
-            raw_window_handle: window_handle.as_raw(),
-        };
-
-        // Use the existing context's instance if available, otherwise create a new one.
-        // The surface must be created with the same instance that will be used for
-        // adapter selection, otherwise wgpu will panic.
-        let instance = gpu_context
-            .borrow()
-            .as_ref()
-            .map(|ctx| ctx.instance.clone())
-            .unwrap_or_else(|| WgpuContext::instance(Box::new(window.clone())));
-
-        // Safety: The caller guarantees that the window handle is valid for the
-        // lifetime of this renderer. In practice, the RawWindow struct is created
-        // from the native window handles and the surface is dropped before the window.
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(target)
-                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
-        };
-
         let mut ctx_ref = gpu_context.borrow_mut();
-        let context = match ctx_ref.as_mut() {
+        let (context, surface) = match ctx_ref.as_mut() {
             Some(context) => {
+                let surface = create_surface(&context.instance, window_handle.as_raw())?;
                 context.check_compatible_with_surface(&surface)?;
-                context
+                (context, surface)
             }
-            None => ctx_ref.insert(WgpuContext::new(instance, &surface, compositor_gpu)?),
+            None => {
+                let (context, surface) = create_context_and_surface(
+                    window,
+                    window_handle.as_raw(),
+                    compositor_gpu,
+                    false,
+                )?;
+                (ctx_ref.insert(context), surface)
+            }
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
@@ -590,8 +575,6 @@ impl WgpuRenderer {
             globals_bind_group,
             path_globals_bind_group,
             instance_data,
-            // Defer intermediate texture creation to first draw call via ensure_intermediate_textures().
-            // This avoids panics when the device/surface is in an invalid state during initialization.
             path_intermediate_texture: None,
             path_intermediate_view: None,
             path_msaa_texture: None,
@@ -1137,9 +1120,9 @@ impl WgpuRenderer {
                 .surface
                 .configure(&resources.device, &surface_config);
 
-            // Invalidate intermediate textures - they will be lazily recreated
-            // in draw() after we confirm the surface is healthy. This avoids
-            // panics when the device/surface is in an invalid state during resize.
+            // Invalidate intermediate textures - the next frame that draws paths
+            // recreates them at the new size, so windows without paths never
+            // allocate them.
             resources.invalidate_intermediate_textures();
         }
     }
@@ -1328,9 +1311,6 @@ impl WgpuRenderer {
                 return false;
             }
         };
-
-        // Now that we know the surface is healthy, ensure intermediate textures exist
-        self.ensure_intermediate_textures();
 
         let frame_view = frame
             .texture
@@ -1762,6 +1742,8 @@ impl WgpuRenderer {
             return Ok(false);
         }
 
+        self.ensure_intermediate_textures();
+
         let vertex_binding = self.write_instance_binding(
             "path_rasterization_bind_group",
             instance_offset,
@@ -2134,10 +2116,12 @@ impl WgpuRenderer {
             // may need more time to come back (e.g. after suspend/resume).
             std::thread::sleep(std::time::Duration::from_millis(350));
 
-            let instance = WgpuContext::instance(Box::new(window.clone()));
-            let surface = create_surface(&instance, window_handle.as_raw())?;
-            let new_context =
-                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
+            let (new_context, surface) = create_context_and_surface(
+                window,
+                window_handle.as_raw(),
+                self.compositor_gpu,
+                true,
+            )?;
             *gpu_context.borrow_mut() = Some(new_context);
             surface
         } else {
@@ -2180,6 +2164,66 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
 }
 
 #[cfg(not(target_family = "wasm"))]
+fn create_context_and_surface<W>(
+    window: &W,
+    raw_window_handle: raw_window_handle::RawWindowHandle,
+    compositor_gpu: Option<CompositorGpuHint>,
+    reject_software: bool,
+) -> anyhow::Result<(WgpuContext, wgpu::Surface<'static>)>
+where
+    W: HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+{
+    let device_id_override = std::env::var("ZED_DEVICE_ID").ok();
+    create_with_backend_fallback(
+        device_id_override.as_deref(),
+        reject_software,
+        |backends, reject_software| {
+            let instance = WgpuContext::instance_with_backends(Box::new(window.clone()), backends);
+            let surface = create_surface(&instance, raw_window_handle)?;
+            let context = if reject_software {
+                WgpuContext::new_rejecting_software(instance, &surface, compositor_gpu)?
+            } else {
+                WgpuContext::new(instance, &surface, compositor_gpu)?
+            };
+            if backends == wgpu::Backends::VULKAN {
+                anyhow::ensure!(
+                    supports_vulkan_fast_path(context.adapter.get_info().device_type),
+                    "Vulkan adapter needs comparison with OpenGL adapters"
+                );
+            }
+            Ok((context, surface))
+        },
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn supports_vulkan_fast_path(device_type: wgpu::DeviceType) -> bool {
+    matches!(
+        device_type,
+        wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn create_with_backend_fallback<T>(
+    device_id_override: Option<&str>,
+    reject_software: bool,
+    mut create: impl FnMut(wgpu::Backends, bool) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if !device_id_override.is_some_and(|id| crate::wgpu_context::parse_pci_id(id).is_ok()) {
+        match create(wgpu::Backends::VULKAN, true) {
+            Ok(context) => return Ok(context),
+            Err(error) => {
+                log::info!(
+                    "Hardware Vulkan initialization failed: {error:#}; trying Vulkan and OpenGL"
+                );
+            }
+        }
+    }
+    create(wgpu::Backends::VULKAN | wgpu::Backends::GL, reject_software)
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn create_surface(
     instance: &wgpu::Instance,
     raw_window_handle: raw_window_handle::RawWindowHandle,
@@ -2191,7 +2235,7 @@ fn create_surface(
                 raw_display_handle: None,
                 raw_window_handle,
             })
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))
     }
 }
 
@@ -2244,6 +2288,135 @@ impl RenderingParameters {
 mod tests {
     use super::*;
     use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vulkan_fast_path_preserves_priority_over_gl_device_types() {
+        assert!(supports_vulkan_fast_path(wgpu::DeviceType::DiscreteGpu));
+        assert!(supports_vulkan_fast_path(wgpu::DeviceType::IntegratedGpu));
+        assert!(!supports_vulkan_fast_path(wgpu::DeviceType::Other));
+        assert!(!supports_vulkan_fast_path(wgpu::DeviceType::VirtualGpu));
+        assert!(!supports_vulkan_fast_path(wgpu::DeviceType::Cpu));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn valid_device_override_preserves_combined_adapter_selection() {
+        for device_id in ["1001", "0x1001", " 0X1001 "] {
+            for reject_software in [false, true] {
+                let mut attempts = Vec::new();
+                create_with_backend_fallback(
+                    Some(device_id),
+                    reject_software,
+                    |backends, reject_software| {
+                        attempts.push((backends, reject_software));
+                        Ok(())
+                    },
+                )
+                .expect("explicit adapter selection should succeed");
+
+                assert_eq!(
+                    attempts,
+                    [(wgpu::Backends::VULKAN | wgpu::Backends::GL, reject_software)]
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn invalid_device_override_does_not_disable_vulkan_fast_path() {
+        let mut attempts = Vec::new();
+        create_with_backend_fallback(Some("invalid"), false, |backends, reject_software| {
+            attempts.push((backends, reject_software));
+            Ok(())
+        })
+        .expect("an invalid override should not prevent initialization");
+
+        assert_eq!(attempts, [(wgpu::Backends::VULKAN, true)]);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn hardware_vulkan_success_does_not_initialize_gl() {
+        let mut attempts = Vec::new();
+        let selected = create_with_backend_fallback(None, false, |backends, reject_software| {
+            attempts.push((backends, reject_software));
+            Ok(wgpu::Backend::Vulkan)
+        })
+        .expect("hardware Vulkan should succeed");
+
+        assert_eq!(selected, wgpu::Backend::Vulkan);
+        assert_eq!(attempts, [(wgpu::Backends::VULKAN, true)]);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn failed_vulkan_surface_uses_combined_backend_fallback() {
+        let mut attempts = Vec::new();
+        let selected = create_with_backend_fallback(None, false, |backends, reject_software| {
+            attempts.push((backends, reject_software));
+            if backends == wgpu::Backends::VULKAN {
+                anyhow::bail!("Vulkan surface configuration failed");
+            }
+            Ok(wgpu::Backend::Gl)
+        })
+        .expect("OpenGL should remain available");
+
+        assert_eq!(selected, wgpu::Backend::Gl);
+        assert_eq!(
+            attempts,
+            [
+                (wgpu::Backends::VULKAN, true),
+                (wgpu::Backends::VULKAN | wgpu::Backends::GL, false),
+            ]
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn software_vulkan_remains_available_at_startup() {
+        let mut attempts = Vec::new();
+        let selected = create_with_backend_fallback(None, false, |backends, reject_software| {
+            attempts.push((backends, reject_software));
+            if reject_software {
+                anyhow::bail!("Only a CPU adapter is available");
+            }
+            Ok(wgpu::Backend::Vulkan)
+        })
+        .expect("startup should retain software fallback");
+
+        assert_eq!(selected, wgpu::Backend::Vulkan);
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[1].0.contains(wgpu::Backends::VULKAN));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn recovery_rejects_software_on_both_attempts() {
+        let mut attempts = Vec::new();
+        let result = create_with_backend_fallback(None, true, |backends, reject_software| {
+            attempts.push((backends, reject_software));
+            if reject_software {
+                anyhow::bail!("Hardware GPU has not recovered");
+            }
+            Ok(())
+        });
+
+        assert_eq!(
+            result
+                .expect_err("recovery should wait for hardware")
+                .to_string(),
+            "Hardware GPU has not recovered"
+        );
+        assert_eq!(
+            attempts,
+            [
+                (wgpu::Backends::VULKAN, true),
+                (wgpu::Backends::VULKAN | wgpu::Backends::GL, true),
+            ]
+        );
+    }
 
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
