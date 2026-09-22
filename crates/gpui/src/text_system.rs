@@ -51,6 +51,7 @@ pub const SUBPIXEL_VARIANTS_Y: u8 = 1;
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
+    resolved_fonts: RwLock<FxHashMap<Font, FontId>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
@@ -66,6 +67,7 @@ impl TextSystem {
             font_metrics: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
+            resolved_fonts: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
             fallback_font_stack: smallvec![
@@ -96,6 +98,7 @@ impl TextSystem {
 
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        self.resolved_fonts.write().clear();
         self.platform_text_system.add_fonts(fonts)
     }
 
@@ -142,6 +145,17 @@ impl TextSystem {
     ///
     /// Panics if the font and none of the fallbacks can be resolved.
     pub fn resolve_font(&self, font: &Font) -> FontId {
+        if let Some(font_id) = self.resolved_fonts.read().get(font) {
+            return *font_id;
+        }
+        let font_id = self.resolve_font_uncached(font);
+        self.resolved_fonts.write().insert(font.clone(), font_id);
+        font_id
+    }
+
+    // Walking the fallback stack costs one failed lookup, and one formatted
+    // error, per missing family, so each font is only walked once.
+    fn resolve_font_uncached(&self, font: &Font) -> FontId {
         if let Ok(font_id) = self.font_id(font) {
             return font_id;
         }
