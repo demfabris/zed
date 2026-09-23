@@ -8,7 +8,7 @@ use gpui::{
 };
 use metal::Device;
 use parking_lot::Mutex;
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::Cell, collections::BTreeSet, sync::Arc};
 
 pub struct MetalAtlas(Mutex<MetalAtlasState>);
 
@@ -20,11 +20,44 @@ impl MetalAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             tiles_by_key: Default::default(),
+            next_frame: 0,
+            active_frames: BTreeSet::new(),
+            pending_allocations: 0,
         }))
     }
 
     pub(crate) fn metal_texture(&self, id: AtlasTextureId) -> metal::Texture {
         self.0.lock().texture(id).metal_texture.clone()
+    }
+
+    pub(crate) fn begin_frame(self: &Arc<Self>) -> MetalAtlasFrame {
+        let mut state = self.0.lock();
+        let serial = state.next_frame;
+        state.next_frame = serial.checked_add(1).expect("atlas frame serial overflow");
+        state.active_frames.insert(serial);
+        MetalAtlasFrame {
+            atlas: self.clone(),
+            serial: Cell::new(Some(serial)),
+        }
+    }
+}
+
+pub(crate) struct MetalAtlasFrame {
+    atlas: Arc<MetalAtlas>,
+    serial: Cell<Option<u64>>,
+}
+
+impl MetalAtlasFrame {
+    pub(crate) fn complete(&self) {
+        if let Some(serial) = self.serial.take() {
+            self.atlas.0.lock().complete_frame(serial);
+        }
+    }
+}
+
+impl Drop for MetalAtlasFrame {
+    fn drop(&mut self) {
+        self.complete();
     }
 }
 
@@ -34,6 +67,9 @@ struct MetalAtlasState {
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    next_frame: u64,
+    active_frames: BTreeSet<u64>,
+    pending_allocations: usize,
 }
 
 impl PlatformAtlas for MetalAtlas {
@@ -65,6 +101,7 @@ impl PlatformAtlas for MetalAtlas {
             return;
         };
         let id = tile.texture_id;
+        let retire_after = lock.active_frames.last().copied();
 
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
@@ -81,18 +118,53 @@ impl PlatformAtlas for MetalAtlas {
         };
 
         if let Some(mut texture) = texture_slot.take() {
-            texture.allocator.deallocate(tile.tile_id.into());
+            let previously_pending = texture.retired_allocations.len();
             texture.decrement_ref_count();
-            if texture.is_unreferenced() {
+            let pending = if texture.is_unreferenced() {
                 textures.free_list.push(id.index as usize);
+                0
             } else {
+                if let Some(serial) = retire_after {
+                    texture
+                        .retired_allocations
+                        .push((serial, tile.tile_id.into()));
+                } else {
+                    texture.allocator.deallocate(tile.tile_id.into());
+                }
+                let pending = texture.retired_allocations.len();
                 *texture_slot = Some(texture);
-            }
+                pending
+            };
+            lock.pending_allocations = lock.pending_allocations - previously_pending + pending;
         }
     }
 }
 
 impl MetalAtlasState {
+    fn complete_frame(&mut self, serial: u64) {
+        let removed = self.active_frames.remove(&serial);
+        debug_assert!(removed);
+        if self.pending_allocations == 0 {
+            return;
+        }
+        let first_active = self.active_frames.first().copied();
+        for texture in self
+            .monochrome_textures
+            .iter_mut()
+            .chain(self.polychrome_textures.iter_mut())
+        {
+            texture.retired_allocations.retain(|(serial, allocation)| {
+                if first_active.is_none_or(|active| active > *serial) {
+                    texture.allocator.deallocate(*allocation);
+                    self.pending_allocations -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -176,6 +248,7 @@ impl MetalAtlasState {
             allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
             metal_texture: AssertSend(metal_texture),
             live_atlas_keys: 0,
+            retired_allocations: Vec::new(),
         };
 
         if let Some(ix) = index {
@@ -205,6 +278,7 @@ struct MetalAtlasTexture {
     allocator: BucketedAtlasAllocator,
     metal_texture: AssertSend<metal::Texture>,
     live_atlas_keys: u32,
+    retired_allocations: Vec<(u64, etagere::AllocId)>,
 }
 
 impl MetalAtlasTexture {
@@ -275,8 +349,10 @@ unsafe impl<T> Send for AssertSend<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use block::ConcreteBlock;
+    use foreign_types::ForeignType;
     use gpui::PlatformAtlas;
-    use std::borrow::Cow;
+    use std::{borrow::Cow, sync::mpsc, time::Duration};
 
     fn create_atlas() -> Option<MetalAtlas> {
         let device = metal::Device::system_default()?;
@@ -375,5 +451,222 @@ mod tests {
         };
         let key = make_image_key(999, 0);
         atlas.remove(&key);
+    }
+
+    #[test]
+    fn retired_tiles_wait_for_all_older_frames_but_not_newer_frames() {
+        fn require_send<T: Send>() {}
+        require_send::<MetalAtlasFrame>();
+        let Some(atlas) = create_atlas().map(Arc::new) else {
+            return;
+        };
+        let keeper = make_image_key(10, 0);
+        let old = make_image_key(11, 0);
+        let extent = gpui::size(DevicePixels(700), DevicePixels(700));
+        insert_tile(&atlas, &keeper, gpui::size(64.into(), 64.into()));
+        let tile = insert_tile(&atlas, &old, extent);
+        let first = atlas.begin_frame();
+        let second = atlas.begin_frame();
+        atlas.remove(&old);
+        atlas.remove(&old);
+        assert_eq!(atlas.0.lock().pending_allocations, 1);
+        assert!(!atlas.0.lock().tiles_by_key.contains_key(&old));
+        let newer = atlas.begin_frame();
+        second.complete();
+        assert_eq!(atlas.0.lock().pending_allocations, 1);
+        let replacement = insert_tile(&atlas, &make_image_key(12, 0), extent);
+        assert_ne!(replacement.texture_id, tile.texture_id);
+        first.complete();
+        first.complete();
+        assert_eq!(atlas.0.lock().pending_allocations, 0);
+        assert_eq!(atlas.0.lock().active_frames.len(), 1);
+        let reused = insert_tile(&atlas, &make_image_key(13, 0), extent);
+        assert_eq!(reused.texture_id, tile.texture_id);
+        assert_eq!(reused.bounds, tile.bounds);
+        drop(newer);
+        assert!(atlas.0.lock().active_frames.is_empty());
+    }
+
+    #[test]
+    fn retirement_does_not_follow_recycled_texture_indices() {
+        let Some(atlas) = create_atlas().map(Arc::new) else {
+            return;
+        };
+        let extent = gpui::size(DevicePixels(700), DevicePixels(700));
+        let keeper = make_image_key(20, 0);
+        let old = make_image_key(21, 0);
+        insert_tile(&atlas, &keeper, gpui::size(64.into(), 64.into()));
+        let tile = insert_tile(&atlas, &old, extent);
+        let original_texture = atlas.metal_texture(tile.texture_id);
+        let first = atlas.begin_frame();
+        atlas.remove(&old);
+        atlas.remove(&keeper);
+        assert_eq!(atlas.0.lock().pending_allocations, 0);
+        let next_keeper = make_image_key(22, 0);
+        let next = make_image_key(23, 0);
+        let keeper_tile = insert_tile(&atlas, &next_keeper, gpui::size(64.into(), 64.into()));
+        assert_eq!(keeper_tile.texture_id, tile.texture_id);
+        assert_ne!(
+            atlas.metal_texture(keeper_tile.texture_id).as_ptr(),
+            original_texture.as_ptr()
+        );
+        let next_tile = insert_tile(&atlas, &next, extent);
+        let second = atlas.begin_frame();
+        atlas.remove(&next);
+        first.complete();
+        assert_eq!(atlas.0.lock().pending_allocations, 1);
+        assert!(atlas.0.lock().tiles_by_key.contains_key(&next_keeper));
+        second.complete();
+        assert_eq!(atlas.0.lock().pending_allocations, 0);
+        let reused = insert_tile(&atlas, &make_image_key(24, 0), extent);
+        assert_eq!(reused.texture_id, next_tile.texture_id);
+        assert_eq!(reused.bounds, next_tile.bounds);
+    }
+
+    #[test]
+    fn abandoning_an_uncommitted_buffer_retires_its_atlas_frame() {
+        let Some(atlas) = create_atlas().map(Arc::new) else {
+            return;
+        };
+        let keeper = make_image_key(30, 0);
+        let old = make_image_key(31, 0);
+        let extent = gpui::size(DevicePixels(700), DevicePixels(700));
+        insert_tile(&atlas, &keeper, gpui::size(64.into(), 64.into()));
+        let old_tile = insert_tile(&atlas, &old, extent);
+        let device = metal::Device::system_default().unwrap();
+        let queue = device.new_command_queue();
+        objc::rc::autoreleasepool(|| {
+            let commands = queue.new_command_buffer().to_owned();
+            let frame = atlas.begin_frame();
+            let block = ConcreteBlock::new(move |_| frame.complete()).copy();
+            commands.add_completed_handler(&block);
+            drop(block);
+            atlas.remove(&old);
+            assert_eq!(atlas.0.lock().pending_allocations, 1);
+            drop(commands);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !atlas.0.lock().active_frames.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(atlas.0.lock().active_frames.is_empty());
+        assert_eq!(atlas.0.lock().pending_allocations, 0);
+        let reused = insert_tile(&atlas, &make_image_key(32, 0), extent);
+        assert_eq!(reused.texture_id, old_tile.texture_id);
+        assert_eq!(reused.bounds, old_tile.bounds);
+    }
+
+    struct SignalOnDrop(metal::SharedEvent);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            self.0.set_signaled_value(1);
+        }
+    }
+
+    #[test]
+    fn inflight_replacement_preserves_old_pixels_and_reuses_space_after_completion() {
+        let Some(atlas) = create_atlas().map(Arc::new) else {
+            return;
+        };
+        objc::rc::autoreleasepool(|| {
+            let device = metal::Device::system_default().unwrap();
+            let queue = device.new_command_queue();
+            let keeper = make_image_key(40, 0);
+            insert_tile(&atlas, &keeper, gpui::size(64.into(), 64.into()));
+            let old = make_image_key(41, 0);
+            let extent = gpui::size(DevicePixels(700), DevicePixels(700));
+            let tile = atlas
+                .get_or_insert_with(&old, &mut || {
+                    Ok(Some((extent, Cow::Owned(vec![0x11; 700 * 700 * 4]))))
+                })
+                .unwrap()
+                .unwrap();
+            let frame = atlas.begin_frame();
+            let texture = atlas.metal_texture(tile.texture_id);
+            let output = device.new_buffer(512, metal::MTLResourceOptions::StorageModeShared);
+            let gate = SignalOnDrop(device.new_shared_event());
+            let commands = queue.new_command_buffer();
+            commands.encode_wait_for_event(&gate.0, 1);
+            let blit = commands.new_blit_command_encoder();
+            blit.copy_from_texture_to_buffer(
+                &texture,
+                0,
+                0,
+                metal::MTLOrigin {
+                    x: tile.bounds.origin.x.0 as u64,
+                    y: tile.bounds.origin.y.0 as u64,
+                    z: 0,
+                },
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                &output,
+                0,
+                256,
+                256,
+                metal::MTLBlitOption::None,
+            );
+            blit.end_encoding();
+            let (complete, completed) = mpsc::channel();
+            let block = ConcreteBlock::new(move |_| {
+                frame.complete();
+                complete.send(()).unwrap();
+            })
+            .copy();
+            commands.add_completed_handler(&block);
+            commands.commit();
+            atlas.remove(&old);
+            let replacement = atlas
+                .get_or_insert_with(&make_image_key(42, 0), &mut || {
+                    Ok(Some((extent, Cow::Owned(vec![0x99; 700 * 700 * 4]))))
+                })
+                .unwrap()
+                .unwrap();
+            assert_ne!(replacement.texture_id, tile.texture_id);
+            let replacement_texture = atlas.metal_texture(replacement.texture_id);
+            let replacement_commands = queue.new_command_buffer();
+            let replacement_blit = replacement_commands.new_blit_command_encoder();
+            replacement_blit.copy_from_texture_to_buffer(
+                &replacement_texture,
+                0,
+                0,
+                metal::MTLOrigin {
+                    x: replacement.bounds.origin.x.0 as u64,
+                    y: replacement.bounds.origin.y.0 as u64,
+                    z: 0,
+                },
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                &output,
+                256,
+                256,
+                256,
+                metal::MTLBlitOption::None,
+            );
+            replacement_blit.end_encoding();
+            replacement_commands.commit();
+            gate.0.set_signaled_value(1);
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+            replacement_commands.wait_until_completed();
+            assert_eq!(commands.status(), metal::MTLCommandBufferStatus::Completed);
+            assert_eq!(
+                replacement_commands.status(),
+                metal::MTLCommandBufferStatus::Completed
+            );
+            let bytes = unsafe { std::slice::from_raw_parts(output.contents().cast::<u8>(), 260) };
+            assert_eq!(&bytes[..4], &[0x11; 4]);
+            assert_eq!(&bytes[256..260], &[0x99; 4]);
+            assert_eq!(atlas.0.lock().pending_allocations, 0);
+            let reused = insert_tile(&atlas, &make_image_key(43, 0), extent);
+            assert_eq!(reused.texture_id, tile.texture_id);
+            assert_eq!(reused.bounds, tile.bounds);
+        });
     }
 }
