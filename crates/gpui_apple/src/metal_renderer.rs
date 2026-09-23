@@ -522,6 +522,7 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
+        let atlas_frame = self.sprite_atlas.begin_frame();
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
@@ -536,6 +537,7 @@ impl MetalRenderer {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            atlas_frame.complete();
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {
@@ -1690,6 +1692,105 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 mod tests {
     use super::*;
     use gpui::{Quad, Shadow, hsla, px};
+
+    fn small_target(renderer: &MetalRenderer) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(16);
+        descriptor.set_height(16);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        renderer.device.new_texture(&descriptor)
+    }
+
+    #[test]
+    fn abandoned_render_frame_releases_its_atlas_guard() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let atlas = renderer.sprite_atlas.clone();
+        assert_eq!(Arc::strong_count(&atlas), 2);
+        objc::rc::autoreleasepool(|| -> Result<()> {
+            let target = small_target(&renderer);
+            let commands =
+                renderer.render_frame(&Scene::default(), &target, size(16.into(), 16.into()))?;
+            assert_eq!(Arc::strong_count(&atlas), 3);
+            drop(commands);
+            Ok(())
+        })?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Arc::strong_count(&atlas) != 2 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(Arc::strong_count(&atlas), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_encoding_and_invalid_targets_leave_no_atlas_guard() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let atlas = renderer.sprite_atlas.clone();
+        let mut path = Path::new(point(px(0.0), px(0.0)));
+        path.line_to(point(px(16.0), px(0.0)));
+        path.line_to(point(px(0.0), px(16.0)));
+        path.content_mask.bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(16.0), px(16.0)));
+        let mut scene = Scene::default();
+        scene.insert_primitive(path.scale(1.0));
+        scene.finish();
+        objc::rc::autoreleasepool(|| {
+            let target = small_target(&renderer);
+            let error = renderer
+                .render_frame(&scene, &target, size(16.into(), 16.into()))
+                .err()
+                .expect("headless path target was not initialized");
+            assert!(
+                error
+                    .to_string()
+                    .contains("missing path intermediate texture")
+            );
+            assert_eq!(Arc::strong_count(&atlas), 2);
+        });
+        assert!(
+            renderer
+                .render_scene(&scene, size(0.into(), 16.into()))
+                .is_err()
+        );
+        assert!(
+            renderer
+                .render_scene_to_image(&scene, size(16.into(), 0.into()))
+                .is_err()
+        );
+        assert!(renderer.render_to_image(&scene).is_err());
+        renderer.draw(&scene);
+        assert_eq!(Arc::strong_count(&atlas), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_render_frame_outlives_renderer_without_retaining_it() -> Result<()> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let atlas = Arc::downgrade(&renderer.sprite_atlas);
+        objc::rc::autoreleasepool(|| -> Result<()> {
+            let target = small_target(&renderer);
+            let commands =
+                renderer.render_frame(&Scene::default(), &target, size(16.into(), 16.into()))?;
+            drop(renderer);
+            assert!(atlas.upgrade().is_some());
+            commands.commit();
+            commands.wait_until_completed();
+            assert_eq!(commands.status(), metal::MTLCommandBufferStatus::Completed);
+            Ok(())
+        })?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while atlas.upgrade().is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(atlas.upgrade().is_none());
+        Ok(())
+    }
 
     #[test]
     fn translucent_layers_preserve_source_over_alpha() -> Result<()> {
