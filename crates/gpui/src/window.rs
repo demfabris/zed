@@ -1884,6 +1884,7 @@ impl Window {
                     .update(&mut cx, |_, window, _| {
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || needs_present
                         {
                             window.platform_window.schedule_frame();
                         }
