@@ -948,6 +948,19 @@ fragment float4 surface_bgra_fragment(
   return bgra_texture.sample(texture_sampler, input.texture_position) * coverage;
 }
 
+// Outputs only coverage: the hole pipeline blends it as dst * (1 - coverage),
+// clearing whatever was drawn under the surface's rounded shape.
+fragment float4 surface_hole_fragment(
+    SurfaceFragmentInput input [[stage_in]],
+    constant SurfaceBounds *surfaces
+    [[buffer(SurfaceInputIndex_Surfaces)]]) {
+  SurfaceBounds surface = surfaces[input.surface_id];
+  float coverage = saturate(
+      0.5 - quad_sdf_smooth(input.position.xy, surface.bounds,
+                            surface.corner_radii, surface.corner_smoothing));
+  return float4(0.0, 0.0, 0.0, coverage);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;

@@ -5264,8 +5264,41 @@ impl Window {
             content_mask,
             corner_radii: corner_radii.scale(self.scale_factor()),
             corner_smoothing: self.default_corner_smoothing,
-            image_buffer,
+            image_buffer: Some(image_buffer),
         });
+    }
+
+    /// Clear the given rounded rectangle to transparent so a native layer
+    /// placed below the window's renderer shows through it. Primitives painted
+    /// later still draw over the hole. Call [`Window::set_underlay_active`]
+    /// while any hole is on screen, or the opaque renderer hides the layer.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_underlay_hole(&mut self, bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            corner_radii: corner_radii.scale(self.scale_factor()),
+            corner_smoothing: self.default_corner_smoothing,
+            image_buffer: None,
+        });
+    }
+
+    /// Mark whether native layers sit below this window's renderer and show
+    /// through [`Window::paint_underlay_hole`]. While active, the renderer's
+    /// layer is transparent where nothing is drawn and presents inside the
+    /// current Core Animation transaction, so layer geometry set during paint
+    /// lands in the same frame as the drawing around it.
+    pub fn set_underlay_active(&self, active: bool) {
+        self.platform_window.set_underlay_active(active);
     }
 
     /// Paint a wgpu texture into the scene for the next frame at the current z-index.

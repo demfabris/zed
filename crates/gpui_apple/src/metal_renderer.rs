@@ -116,6 +116,7 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    underlay_active: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -128,6 +129,7 @@ pub struct MetalRenderer {
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
     bgra_surfaces_pipeline_state: metal::RenderPipelineState,
+    hole_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -333,6 +335,14 @@ impl MetalRenderer {
             "surface_bgra_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let hole_surfaces_pipeline_state = build_hole_pipeline_state(
+            &device,
+            &library,
+            "hole_surfaces",
+            "surface_vertex",
+            "surface_hole_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -343,6 +353,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            underlay_active: false,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -356,6 +367,7 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
             bgra_surfaces_pipeline_state,
+            hole_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -386,8 +398,28 @@ impl MetalRenderer {
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
         if let Some(layer) = &self.layer {
-            layer.set_presents_with_transaction(presents_with_transaction);
+            layer.set_presents_with_transaction(self.transactional_present());
         }
+    }
+
+    /// See `Window::set_underlay_active`.
+    pub fn set_underlay_active(&mut self, active: bool) {
+        if self.underlay_active == active {
+            return;
+        }
+        self.underlay_active = active;
+        if let Some(layer) = &self.layer {
+            layer.set_opaque(self.layer_opaque());
+            layer.set_presents_with_transaction(self.transactional_present());
+        }
+    }
+
+    fn transactional_present(&self) -> bool {
+        self.presents_with_transaction || self.underlay_active
+    }
+
+    fn layer_opaque(&self) -> bool {
+        self.opaque && !self.underlay_active
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -447,7 +479,7 @@ impl MetalRenderer {
     pub fn update_transparency(&mut self, transparent: bool) {
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
-            layer.set_opaque(!transparent);
+            layer.set_opaque(self.layer_opaque());
         }
     }
 
@@ -488,7 +520,7 @@ impl MetalRenderer {
             }
         };
 
-        if self.presents_with_transaction {
+        if self.transactional_present() {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
             drawable.present();
@@ -678,7 +710,7 @@ impl MetalRenderer {
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
-        let alpha = if self.opaque { 1. } else { 0. };
+        let alpha = if self.layer_opaque() { 1. } else { 0. };
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -1169,25 +1201,42 @@ impl MetalRenderer {
         );
 
         for (index, surface) in surfaces.iter().enumerate() {
+            let Some(image_buffer) = &surface.image_buffer else {
+                command_encoder.set_render_pipeline_state(&self.hole_surfaces_pipeline_state);
+                let texture_size = size(DevicePixels::from(0), DevicePixels::from(0));
+                command_encoder.set_vertex_bytes(
+                    SurfaceInputIndex::TextureSize as u64,
+                    mem::size_of_val(&texture_size) as u64,
+                    &texture_size as *const Size<DevicePixels> as *const _,
+                );
+                command_encoder.draw_primitives_instanced_base_instance(
+                    metal::MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                    (first_surface + index) as u64,
+                );
+                continue;
+            };
             let texture_size = size(
-                DevicePixels::from(surface.image_buffer.get_width() as i32),
-                DevicePixels::from(surface.image_buffer.get_height() as i32),
+                DevicePixels::from(image_buffer.get_width() as i32),
+                DevicePixels::from(image_buffer.get_height() as i32),
             );
 
             let mut y_texture = None;
             let mut cb_cr_texture = None;
             let mut bgra_texture = None;
-            let pixel_format = surface.image_buffer.get_pixel_format();
+            let pixel_format = image_buffer.get_pixel_format();
             if pixel_format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
                 command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
                 y_texture = Some(
                     self.core_video_texture_cache
                         .create_texture_from_image(
-                            surface.image_buffer.as_concrete_TypeRef(),
+                            image_buffer.as_concrete_TypeRef(),
                             None,
                             MTLPixelFormat::R8Unorm,
-                            surface.image_buffer.get_width_of_plane(0),
-                            surface.image_buffer.get_height_of_plane(0),
+                            image_buffer.get_width_of_plane(0),
+                            image_buffer.get_height_of_plane(0),
                             0,
                         )
                         .unwrap(),
@@ -1195,11 +1244,11 @@ impl MetalRenderer {
                 cb_cr_texture = Some(
                     self.core_video_texture_cache
                         .create_texture_from_image(
-                            surface.image_buffer.as_concrete_TypeRef(),
+                            image_buffer.as_concrete_TypeRef(),
                             None,
                             MTLPixelFormat::RG8Unorm,
-                            surface.image_buffer.get_width_of_plane(1),
-                            surface.image_buffer.get_height_of_plane(1),
+                            image_buffer.get_width_of_plane(1),
+                            image_buffer.get_height_of_plane(1),
                             1,
                         )
                         .unwrap(),
@@ -1209,11 +1258,11 @@ impl MetalRenderer {
                 bgra_texture = Some(
                     self.core_video_texture_cache
                         .create_texture_from_image(
-                            surface.image_buffer.as_concrete_TypeRef(),
+                            image_buffer.as_concrete_TypeRef(),
                             None,
                             MTLPixelFormat::BGRA8Unorm,
-                            surface.image_buffer.get_width(),
-                            surface.image_buffer.get_height(),
+                            image_buffer.get_width(),
+                            image_buffer.get_height(),
                             0,
                         )
                         .unwrap(),
@@ -1378,6 +1427,40 @@ fn build_premultiplied_pipeline_state(
     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+fn build_hole_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::Zero);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::Zero);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 

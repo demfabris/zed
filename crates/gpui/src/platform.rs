@@ -961,6 +961,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    fn set_underlay_active(&self, _active: bool) {}
     fn minimize(&self);
     /// Take the window off screen without closing it, or put it back.
     ///

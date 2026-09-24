@@ -1919,6 +1919,10 @@ impl PlatformWindow for MacWindow {
 
     fn set_app_id(&mut self, _app_id: &str) {}
 
+    fn set_underlay_active(&self, active: bool) {
+        self.0.as_ref().lock().renderer.set_underlay_active(active);
+    }
+
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
         this.background_appearance = background_appearance;
