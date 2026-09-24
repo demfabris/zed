@@ -667,6 +667,10 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    // Set whenever gpui asks for another frame; a vsync tick that ends with
+    // this still false counts towards pausing the display link.
+    frame_demand: bool,
+    idle_frames: u8,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -925,6 +929,20 @@ impl MacWindowState {
         }
     }
 
+    /// Restart a display link paused for idleness. A window that is not
+    /// visible stays paused; its occlusion handler restarts the link.
+    fn wake_display_link(&mut self) {
+        self.frame_demand = true;
+        self.idle_frames = 0;
+        if !self
+            .frame_source
+            .as_ref()
+            .is_some_and(WindowFrameSource::is_running)
+        {
+            self.start_display_link();
+        }
+    }
+
     fn is_maximized(&self) -> bool {
         fn rect_to_size(rect: NSRect) -> Size<Pixels> {
             let NSSize { width, height } = rect.size;
@@ -1164,6 +1182,8 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                frame_demand: true,
+                idle_frames: 0,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -1923,6 +1943,34 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_app_id(&mut self, _app_id: &str) {}
+
+    fn schedule_frame(&self) {
+        self.0.as_ref().lock().wake_display_link();
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let state = Arc::downgrade(&self.0);
+        let executor = self.0.as_ref().lock().foreground_executor.clone();
+        Some(Rc::new(move || {
+            let Some(strong) = state.upgrade() else {
+                return;
+            };
+            if let Some(mut lock) = strong.try_lock() {
+                lock.wake_display_link();
+                return;
+            }
+            // Woken while this window's state is locked further up the stack;
+            // restart the link once that code has unwound.
+            let state = state.clone();
+            executor
+                .spawn(async move {
+                    if let Some(state) = state.upgrade() {
+                        state.lock().wake_display_link();
+                    }
+                })
+                .detach();
+        }))
+    }
 
     fn set_underlay_active(&self, active: bool) {
         self.0.as_ref().lock().renderer.set_underlay_active(active);
@@ -3383,15 +3431,30 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     }
 }
 
+// Vsync ticks without frame demand before the display link pauses. A few
+// ticks of slack keep bursty input (typing, key repeat) from restarting the
+// link on every event.
+const IDLE_FRAMES_BEFORE_PAUSE: u8 = 3;
+
 extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    lock.frame_demand = false;
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
         callback(Default::default());
-        window_state.lock().request_frame_callback = Some(callback);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        if lock.frame_demand {
+            lock.idle_frames = 0;
+        } else {
+            lock.idle_frames = lock.idle_frames.saturating_add(1);
+            if lock.idle_frames >= IDLE_FRAMES_BEFORE_PAUSE {
+                lock.stop_display_link();
+            }
+        }
     }
 }
 

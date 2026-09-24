@@ -267,6 +267,10 @@ impl WindowFrameSource {
             unsubscribe(display_id, subscriber_id);
         }
     }
+
+    pub fn is_running(&self) -> bool {
+        self.registration.is_some()
+    }
 }
 
 impl Drop for WindowFrameSource {
