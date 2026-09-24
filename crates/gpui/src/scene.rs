@@ -820,8 +820,11 @@ pub struct PaintSurface {
     /// fills a pane whose frame is drawn with quads, so it is cut with their
     /// curve rather than a plain arc.
     pub corner_smoothing: f32,
+    /// `None` punches a hole instead of drawing an image: everything painted
+    /// under the surface's shape is cleared to transparent, so a native layer
+    /// placed below the window's renderer shows through it.
     #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub image_buffer: Option<core_video::pixel_buffer::CVPixelBuffer>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub texture_view: wgpu::TextureView,
     #[cfg(target_os = "windows")]
