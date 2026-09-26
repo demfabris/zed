@@ -563,7 +563,7 @@ pub struct Quad {
     /// arc, `4.0` is a squircle (continuous corner).
     pub corner_smoothing: f32,
     /// Padding for alignment for repr(C) layout.
-    pub(crate) pad: u32,
+    pub pad: [u32; 3],
 }
 
 // Shader-side `Bounds` is built from `vec2<f32>`, so every backend aligns
@@ -572,6 +572,9 @@ pub struct Quad {
 // instance stride below what the shader reads and every draw fails with a
 // binding-size mismatch.
 const _: () = assert!(size_of::<Quad>() % 8 == 0);
+// The WebGL quad decoder fetches whole 16-byte instance texels at a fixed
+// per-instance texel stride, so a quad must also fill its last texel.
+const _: () = assert!(size_of::<Quad>() % 16 == 0);
 const _: () = assert!(size_of::<Shadow>() % 8 == 0);
 
 impl From<Quad> for Primitive {

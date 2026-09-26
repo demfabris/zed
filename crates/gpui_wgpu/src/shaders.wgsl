@@ -578,7 +578,10 @@ struct Quad {
     corner_radii: Corners,
     border_widths: Edges,
     corner_smoothing: f32,
-    pad: u32, // align to 8 bytes
+    // Pads to 44 words: 8-byte aligned, and whole texels for the WebGL decoder.
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 struct QuadVarying {

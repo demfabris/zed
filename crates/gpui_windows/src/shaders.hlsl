@@ -531,7 +531,10 @@ struct Quad {
     Corners corner_radii;
     Edges border_widths;
     float corner_smoothing;
-    uint pad; // align to 8 bytes
+    // Pads to 44 words: 8-byte aligned, and whole texels for the WebGL decoder.
+    uint pad0;
+    uint pad1;
+    uint pad2;
 };
 
 struct QuadVertexOutput {
