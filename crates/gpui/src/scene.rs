@@ -6,13 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    Point, Radians, ScaledPixels, SharedString, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
+    hash::{Hash, Hasher},
     iter::Peekable,
     ops::{Add, Range, Sub},
+    rc::Rc,
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -67,6 +70,13 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub shader_layers: Vec<ShaderLayer>,
+    open_shader_layers: Vec<OpenShaderLayer>,
+}
+
+struct OpenShaderLayer {
+    descriptor: ShaderLayerDescriptor,
+    scene: Scene,
 }
 
 #[expect(missing_docs)]
@@ -84,6 +94,8 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.shader_layers.clear();
+        self.open_shader_layers.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -91,25 +103,75 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        self.target().open_layer(bounds);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
 
     pub fn pop_layer(&mut self) {
-        self.layer_stack.pop();
+        self.target().layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
+    /// Start capturing primitives into a nested scene that the renderer draws
+    /// to a texture and then composites through the descriptor's shader.
+    pub(crate) fn push_shader_layer(&mut self, descriptor: ShaderLayerDescriptor) {
+        self.paint_operations
+            .push(PaintOperation::StartShaderLayer(descriptor.clone()));
+        self.open_shader_layers.push(OpenShaderLayer {
+            descriptor,
+            scene: Scene::default(),
+        });
+    }
+
+    pub(crate) fn pop_shader_layer(&mut self) {
+        self.paint_operations.push(PaintOperation::EndShaderLayer);
+        let Some(OpenShaderLayer {
+            descriptor,
+            mut scene,
+        }) = self.open_shader_layers.pop()
+        else {
+            return;
+        };
+        scene.finish();
+        let layer = ShaderLayer {
+            order: 0,
+            bounds: descriptor.bounds,
+            content_mask: descriptor.content_mask,
+            shader: descriptor.shader,
+            uniforms: descriptor.uniforms,
+            scene: Rc::new(scene),
+        };
+        self.target().place_primitive(Primitive::ShaderLayer(layer));
+    }
+
+    fn target(&mut self) -> &mut Scene {
+        match self.open_shader_layers.len() {
+            0 => self,
+            open => &mut self.open_shader_layers[open - 1].scene,
+        }
+    }
+
+    fn open_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        let order = self.primitive_bounds.insert(bounds);
+        self.layer_stack.push(order);
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        let primitive = primitive.into();
+        if self.target().place_primitive(primitive.clone()) {
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+        }
+    }
+
+    fn place_primitive(&mut self, mut primitive: Primitive) -> bool {
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
-            return;
+            return false;
         }
 
         let order = self
@@ -151,9 +213,12 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::ShaderLayer(layer) => {
+                layer.order = order;
+                self.shader_layers.push(layer.clone());
+            }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        true
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -162,6 +227,10 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartShaderLayer(descriptor) => {
+                    self.push_shader_layer(descriptor.clone())
+                }
+                PaintOperation::EndShaderLayer => self.pop_shader_layer(),
             }
         }
     }
@@ -178,6 +247,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.shader_layers.sort_by_key(|layer| layer.order);
     }
 
     #[cfg_attr(
@@ -205,6 +275,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            shader_layers_start: 0,
+            shader_layers_iter: self.shader_layers.iter().peekable(),
         }
     }
 }
@@ -227,12 +299,15 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    ShaderLayer,
 }
 
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    StartShaderLayer(ShaderLayerDescriptor),
+    EndShaderLayer,
 }
 
 #[derive(Clone)]
@@ -246,6 +321,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    ShaderLayer(ShaderLayer),
 }
 
 #[expect(missing_docs)]
@@ -260,6 +336,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::ShaderLayer(layer) => &layer.bounds,
         }
     }
 
@@ -273,6 +350,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::ShaderLayer(layer) => &layer.content_mask,
         }
     }
 }
@@ -301,6 +379,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    shader_layers_start: usize,
+    shader_layers_iter: Peekable<slice::Iter<'a, ShaderLayer>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -333,6 +413,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.shader_layers_iter.peek().map(|layer| layer.order),
+                PrimitiveKind::ShaderLayer,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -479,6 +563,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::ShaderLayer => {
+                let layers_start = self.shader_layers_start;
+                let mut layers_end = layers_start + 1;
+                self.shader_layers_iter.next();
+                while self
+                    .shader_layers_iter
+                    .next_if(|layer| (layer.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    layers_end += 1;
+                }
+                self.shader_layers_start = layers_end;
+                Some(PrimitiveBatch::ShaderLayers(layers_start..layers_end))
+            }
         }
     }
 }
@@ -511,6 +609,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    ShaderLayers(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -543,6 +642,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::ShaderLayers(range) => format!("shader layers ({})", range.len()),
         }
     }
 }
@@ -1003,5 +1103,161 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+/// A WGSL fragment shader that [`crate::Window::paint_shader_layer`] runs over
+/// what its closure paints.
+///
+/// The module holds one `@fragment` entry point. Its bindings, all in group 0:
+///
+/// - `@binding(0)`: a `texture_2d<f32>` with the layer's content, sized to the
+///   layer in device pixels, premultiplied.
+/// - `@binding(1)`: a `var<uniform>` filled with the layer's uniform bytes.
+/// - `@binding(2)`: a filtering `sampler` that clamps to the edge.
+///
+/// Its only input is `@location(0) vec2<f32>`, the fragment's position inside
+/// the layer in device pixels, with the origin at the top left and pixel
+/// centers on halves. It writes one premultiplied color to `@location(0)`,
+/// which is blended over the frame. A renderer that cannot compile the module
+/// paints the layer's content unchanged.
+#[derive(Clone)]
+pub struct CustomShader(Arc<CustomShaderSource>);
+
+struct CustomShaderSource {
+    id: u64,
+    wgsl: SharedString,
+}
+
+impl CustomShader {
+    /// Wrap WGSL source. Equal sources share one id, so renderers compile
+    /// each distinct module once.
+    pub fn new(wgsl: impl Into<SharedString>) -> Self {
+        let wgsl = wgsl.into();
+        let mut hasher = std::hash::DefaultHasher::new();
+        wgsl.hash(&mut hasher);
+        Self(Arc::new(CustomShaderSource {
+            id: hasher.finish(),
+            wgsl,
+        }))
+    }
+
+    /// A stable identifier derived from the source.
+    pub fn id(&self) -> u64 {
+        self.0.id
+    }
+
+    /// The WGSL source.
+    pub fn wgsl(&self) -> &str {
+        &self.0.wgsl
+    }
+}
+
+impl Debug for CustomShader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomShader")
+            .field("id", &format_args!("{:016x}", self.0.id))
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ShaderLayerDescriptor {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) content_mask: ContentMask<ScaledPixels>,
+    pub(crate) shader: CustomShader,
+    pub(crate) uniforms: Arc<[u8]>,
+}
+
+/// Content painted into its own scene, drawn to a texture and composited
+/// through a [`CustomShader`].
+#[derive(Clone)]
+#[expect(missing_docs)]
+pub struct ShaderLayer {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub shader: CustomShader,
+    pub uniforms: Arc<[u8]>,
+    pub scene: Rc<Scene>,
+}
+
+impl Debug for ShaderLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShaderLayer")
+            .field("order", &self.order)
+            .field("bounds", &self.bounds)
+            .field("shader", &self.shader)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<ShaderLayer> for Primitive {
+    fn from(layer: ShaderLayer) -> Self {
+        Primitive::ShaderLayer(layer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{px, size};
+
+    fn quad(x: f32) -> Quad {
+        let bounds = Bounds::new(point(px(x), px(0.)), size(px(4.), px(4.))).scale(1.0);
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        }
+    }
+
+    fn layer_descriptor() -> ShaderLayerDescriptor {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(32.), px(32.))).scale(1.0);
+        ShaderLayerDescriptor {
+            bounds,
+            content_mask: ContentMask { bounds },
+            shader: CustomShader::new("@fragment fn main() {}"),
+            uniforms: Arc::from([1u8, 2, 3]),
+        }
+    }
+
+    fn paint(scene: &mut Scene) {
+        scene.insert_primitive(quad(0.));
+        scene.push_shader_layer(layer_descriptor());
+        scene.insert_primitive(quad(4.));
+        scene.push_shader_layer(layer_descriptor());
+        scene.insert_primitive(quad(8.));
+        scene.pop_shader_layer();
+        scene.pop_shader_layer();
+        scene.insert_primitive(quad(12.));
+        scene.finish();
+    }
+
+    fn assert_nested(scene: &Scene) {
+        assert_eq!(scene.quads.len(), 2);
+        assert_eq!(scene.shader_layers.len(), 1);
+        let outer = &scene.shader_layers[0].scene;
+        assert_eq!(outer.quads.len(), 1);
+        assert_eq!(outer.shader_layers.len(), 1);
+        assert_eq!(outer.shader_layers[0].scene.quads.len(), 1);
+        assert_eq!(&*scene.shader_layers[0].uniforms, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn shader_layers_capture_what_they_enclose() {
+        let mut scene = Scene::default();
+        paint(&mut scene);
+        assert_nested(&scene);
+    }
+
+    #[test]
+    fn replayed_shader_layers_capture_the_same_primitives() {
+        let mut painted = Scene::default();
+        paint(&mut painted);
+        let mut replayed = Scene::default();
+        replayed.replay(0..painted.len(), &painted);
+        replayed.finish();
+        assert_nested(&replayed);
     }
 }

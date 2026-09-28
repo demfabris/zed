@@ -5,8 +5,8 @@ use collections::FxHashMap;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use gpui::PaintSurface;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, CustomShader, DevicePixels, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, ShaderLayer, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -102,6 +102,46 @@ struct SurfaceParams {
     // The WGSL struct rounds up to its 8-byte alignment.
     pad: f32,
 }
+
+/// The vertex half of every shader layer pipeline; the fragment half is the
+/// layer's [`CustomShader`].
+const SHADER_LAYER_VERTEX: &str = r#"
+struct ShaderLayerParams {
+    bounds: vec4<f32>,
+    viewport_size: vec2<f32>,
+    pad: vec2<f32>,
+}
+
+@group(1) @binding(0) var<uniform> shader_layer: ShaderLayerParams;
+
+struct ShaderLayerVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) layer_position: vec2<f32>,
+}
+
+@vertex
+fn shader_layer_vertex(@builtin(vertex_index) vertex_id: u32) -> ShaderLayerVarying {
+    let unit = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let size = shader_layer.bounds.zw;
+    let position = shader_layer.bounds.xy + unit * size;
+    let device = position / shader_layer.viewport_size * vec2<f32>(2.0, -2.0)
+        + vec2<f32>(-1.0, 1.0);
+    var out: ShaderLayerVarying;
+    out.position = vec4<f32>(device, 0.0, 1.0);
+    out.layer_position = unit * size;
+    return out;
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ShaderLayerParams {
+    bounds: [f32; 4],
+    viewport_size: [f32; 2],
+    pad: [f32; 2],
+}
+
+const MAX_SHADER_LAYER_INPUTS: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -210,11 +250,149 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    shader_layers: ShaderLayerResources,
 }
 
 struct CachedTextureBindGroup {
     texture_generation: u64,
     bind_group: wgpu::BindGroup,
+}
+
+struct ShaderLayerResources {
+    content_layout: wgpu::BindGroupLayout,
+    params_layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    vertex_module: wgpu::ShaderModule,
+    sampler: wgpu::Sampler,
+    pipelines: FxHashMap<u64, Option<ShaderLayerPipeline>>,
+    targets: Vec<RenderTexture>,
+    inputs: Vec<RenderTexture>,
+    drawn: bool,
+}
+
+#[derive(Clone)]
+struct ShaderLayerPipeline {
+    pipeline: wgpu::RenderPipeline,
+    uniform_size: u64,
+}
+
+struct RenderTexture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl RenderTexture {
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        size: Size<DevicePixels>,
+        usage: wgpu::TextureUsages,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shader_layer_texture"),
+            size: wgpu::Extent3d {
+                width: size.width.0 as u32,
+                height: size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { texture, view }
+    }
+
+    fn has_size(&self, size: Size<DevicePixels>) -> bool {
+        self.texture.width() == size.width.0 as u32 && self.texture.height() == size.height.0 as u32
+    }
+}
+
+impl ShaderLayerResources {
+    fn new(device: &wgpu::Device) -> Self {
+        let content_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shader_layer_content_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let params_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shader_layer_params_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(
+                        std::mem::size_of::<ShaderLayerParams>() as u64
+                    ),
+                },
+                count: None,
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shader_layer_pipeline_layout"),
+            bind_group_layouts: &[Some(&content_layout), Some(&params_layout)],
+            immediate_size: 0,
+        });
+        let vertex_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shader_layer_vertex"),
+            source: wgpu::ShaderSource::Wgsl(SHADER_LAYER_VERTEX.into()),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shader_layer_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        Self {
+            content_layout,
+            params_layout,
+            pipeline_layout,
+            vertex_module,
+            sampler,
+            pipelines: FxHashMap::default(),
+            targets: Vec::new(),
+            inputs: Vec::new(),
+            drawn: false,
+        }
+    }
+
+    fn release_textures(&mut self) {
+        self.targets.clear();
+        self.inputs.clear();
+    }
 }
 
 impl WgpuResources {
@@ -223,6 +401,7 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.shader_layers.release_textures();
     }
 }
 
@@ -1313,6 +1492,7 @@ impl WgpuRendererCore {
             ],
         });
         let max_texture_size = device.limits().max_texture_dimension_2d;
+        let shader_layers = ShaderLayerResources::new(&device);
 
         Self {
             resources: WgpuResources {
@@ -1330,6 +1510,7 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                shader_layers,
             },
             atlas,
             path_globals_offset,
@@ -1475,8 +1656,47 @@ impl WgpuRendererCore {
         clear_color: wgpu::Color,
     ) -> Result<wgpu::SubmissionIndex> {
         let mut instance_offset = 0;
+        self.prepare_texture_bind_groups(scene);
+        self.resources.shader_layers.drawn = false;
+
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("main_encoder"),
+                });
+        self.encode_scene(
+            &mut encoder,
+            scene,
+            frame_view,
+            size,
+            wgpu::LoadOp::Clear(clear_color),
+            &mut instance_offset,
+            0,
+        )?;
+        if !self.resources.shader_layers.drawn {
+            self.resources.shader_layers.release_textures();
+        }
+
+        let submission = self
+            .resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+        Ok(submission)
+    }
+
+    fn encode_scene(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        frame_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+        load: wgpu::LoadOp<wgpu::Color>,
+        instance_offset: &mut u64,
+        depth: usize,
+    ) -> Result<()> {
         let instance_bindings = self
-            .write_instances(scene, &mut instance_offset)
+            .write_instances(scene, instance_offset)
             .with_context(|| {
                 format!(
                     "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
@@ -1489,135 +1709,313 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
-        self.prepare_texture_bind_groups(scene);
 
-        let mut encoder =
-            self.resources()
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("main_encoder"),
-                });
+        let mut pass = begin_pass(encoder, frame_view, load, "main_pass");
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::Quads(range) => self.draw_instances(
+                    &instance_bindings.quads,
+                    &self.resources().pipelines.quads,
+                    instance_range(range),
+                    &mut pass,
+                ),
+                PrimitiveBatch::Shadows(range) => self.draw_instances(
+                    &instance_bindings.shadows,
+                    &self.resources().pipelines.shadows,
+                    instance_range(range),
+                    &mut pass,
+                ),
+                PrimitiveBatch::Paths(range) => {
+                    let paths = &scene.paths[range];
+                    if paths.is_empty() {
+                        continue;
+                    }
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
+                    drop(pass);
+                    let rasterized =
+                        self.draw_paths_to_intermediate(encoder, paths, size, instance_offset)?;
 
-            for batch in scene.batches() {
-                match batch {
-                    PrimitiveBatch::Quads(range) => self.draw_instances(
-                        &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
+                    pass = begin_pass(
+                        encoder,
+                        frame_view,
+                        wgpu::LoadOp::Load,
+                        "main_pass_continued",
+                    );
+
+                    if rasterized {
+                        self.draw_paths_from_intermediate(paths, instance_offset, &mut pass)?;
+                    }
+                }
+                PrimitiveBatch::Underlines(range) => self.draw_instances(
+                    &instance_bindings.underlines,
+                    &self.resources().pipelines.underlines,
+                    instance_range(range),
+                    &mut pass,
+                ),
+                PrimitiveBatch::MonochromeSprites { texture_id, range } => {
+                    self.draw_sprites(
+                        &instance_bindings.monochrome_sprites,
+                        texture_id,
+                        &self.resources().pipelines.mono_sprites,
                         instance_range(range),
                         &mut pass,
-                    ),
-                    PrimitiveBatch::Shadows(range) => self.draw_instances(
-                        &instance_bindings.shadows,
-                        &self.resources().pipelines.shadows,
+                    )?;
+                }
+                PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                    let resources = self.resources();
+                    self.draw_sprites(
+                        &instance_bindings.subpixel_sprites,
+                        texture_id,
+                        resources
+                            .pipelines
+                            .subpixel_sprites
+                            .as_ref()
+                            .unwrap_or(&resources.pipelines.mono_sprites),
                         instance_range(range),
                         &mut pass,
-                    ),
-                    PrimitiveBatch::Paths(range) => {
-                        let paths = &scene.paths[range];
-                        if paths.is_empty() {
-                            continue;
-                        }
-
-                        drop(pass);
-                        let rasterized = self.draw_paths_to_intermediate(
-                            &mut encoder,
-                            paths,
+                    )?;
+                }
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                    self.draw_sprites(
+                        &instance_bindings.polychrome_sprites,
+                        texture_id,
+                        &self.resources().pipelines.poly_sprites,
+                        instance_range(range),
+                        &mut pass,
+                    )?;
+                }
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                PrimitiveBatch::Surfaces(range) => {
+                    self.draw_surfaces(&scene.surfaces[range], instance_offset, &mut pass)?
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+                PrimitiveBatch::Surfaces(_) => {}
+                PrimitiveBatch::ShaderLayers(range) => {
+                    drop(pass);
+                    for layer in &scene.shader_layers[range] {
+                        self.draw_shader_layer(
+                            encoder,
+                            layer,
+                            frame_view,
                             size,
-                            &mut instance_offset,
-                        )?;
-
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_continued"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: frame_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-
-                        if rasterized {
-                            self.draw_paths_from_intermediate(
-                                paths,
-                                &mut instance_offset,
-                                &mut pass,
-                            )?;
-                        }
-                    }
-                    PrimitiveBatch::Underlines(range) => self.draw_instances(
-                        &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
-                        instance_range(range),
-                        &mut pass,
-                    ),
-                    PrimitiveBatch::MonochromeSprites { texture_id, range } => {
-                        self.draw_sprites(
-                            &instance_bindings.monochrome_sprites,
-                            texture_id,
-                            &self.resources().pipelines.mono_sprites,
-                            instance_range(range),
-                            &mut pass,
+                            instance_offset,
+                            depth,
                         )?;
                     }
-                    PrimitiveBatch::SubpixelSprites { texture_id, range } => {
-                        let resources = self.resources();
-                        self.draw_sprites(
-                            &instance_bindings.subpixel_sprites,
-                            texture_id,
-                            resources
-                                .pipelines
-                                .subpixel_sprites
-                                .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    PrimitiveBatch::PolychromeSprites { texture_id, range } => {
-                        self.draw_sprites(
-                            &instance_bindings.polychrome_sprites,
-                            texture_id,
-                            &self.resources().pipelines.poly_sprites,
-                            instance_range(range),
-                            &mut pass,
-                        )?;
-                    }
-                    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                    PrimitiveBatch::Surfaces(range) => {
-                        self.draw_surfaces(&scene.surfaces[range], &mut instance_offset, &mut pass)?
-                    }
-                    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-                    PrimitiveBatch::Surfaces(_) => {}
+                    pass = begin_pass(
+                        encoder,
+                        frame_view,
+                        wgpu::LoadOp::Load,
+                        "main_pass_continued",
+                    );
                 }
             }
         }
+        Ok(())
+    }
 
-        let submission = self
-            .resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-        Ok(submission)
+    fn draw_shader_layer(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &ShaderLayer,
+        frame_view: &wgpu::TextureView,
+        size: Size<DevicePixels>,
+        instance_offset: &mut u64,
+        depth: usize,
+    ) -> Result<()> {
+        let Some(region) = shader_layer_region(layer.bounds, size) else {
+            return Ok(());
+        };
+        let Some(pipeline) = self.shader_layer_pipeline(&layer.shader) else {
+            return self.encode_scene(
+                encoder,
+                &layer.scene,
+                frame_view,
+                size,
+                wgpu::LoadOp::Load,
+                instance_offset,
+                depth + 1,
+            );
+        };
+        self.resources.shader_layers.drawn = true;
+
+        let format = self.target_format;
+        let device = self.resources.device.clone();
+        let layers = &mut self.resources.shader_layers;
+        if layers
+            .targets
+            .first()
+            .is_some_and(|target| !target.has_size(size))
+        {
+            layers.targets.clear();
+        }
+        while layers.targets.len() <= depth {
+            layers.targets.push(RenderTexture::new(
+                &device,
+                format,
+                size,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+            ));
+        }
+        let target_view = layers.targets[depth].view.clone();
+        let target_texture = layers.targets[depth].texture.clone();
+        self.encode_scene(
+            encoder,
+            &layer.scene,
+            &target_view,
+            size,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            instance_offset,
+            depth + 1,
+        )?;
+
+        let layers = &mut self.resources.shader_layers;
+        let input_index = match layers
+            .inputs
+            .iter()
+            .position(|input| input.has_size(region.size))
+        {
+            Some(index) => index,
+            None => {
+                if layers.inputs.len() >= MAX_SHADER_LAYER_INPUTS {
+                    layers.inputs.clear();
+                }
+                layers.inputs.push(RenderTexture::new(
+                    &device,
+                    format,
+                    region.size,
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                ));
+                layers.inputs.len() - 1
+            }
+        };
+        let input_texture = layers.inputs[input_index].texture.clone();
+        let input_view = layers.inputs[input_index].view.clone();
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region.origin.x.0 as u32,
+                    y: region.origin.y.0 as u32,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &input_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: region.size.width.0 as u32,
+                height: region.size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let Some(scissor) =
+            shader_layer_region(layer.content_mask.bounds.intersect(&layer.bounds), size)
+        else {
+            return Ok(());
+        };
+        let params = ShaderLayerParams {
+            bounds: [
+                region.origin.x.0 as f32,
+                region.origin.y.0 as f32,
+                region.size.width.0 as f32,
+                region.size.height.0 as f32,
+            ],
+            viewport_size: [size.width.0 as f32, size.height.0 as f32],
+            pad: [0.0; 2],
+        };
+        let params_size = std::mem::size_of::<ShaderLayerParams>() as u64;
+        let uniforms_offset = params_size
+            .next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as u64);
+        let uniforms_size = pipeline.uniform_size.max(16).next_multiple_of(16);
+        let mut uniforms = vec![0u8; uniforms_size as usize];
+        let len = layer.uniforms.len().min(uniforms.len());
+        uniforms[..len].copy_from_slice(&layer.uniforms[..len]);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shader_layer_uniforms"),
+            size: uniforms_offset + uniforms_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let queue = &self.resources.queue;
+        queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
+        queue.write_buffer(&buffer, uniforms_offset, &uniforms);
+
+        let layers = &self.resources.shader_layers;
+        let content = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shader_layer_content"),
+            layout: &layers.content_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&input_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buffer,
+                        offset: uniforms_offset,
+                        size: NonZeroU64::new(uniforms_size),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&layers.sampler),
+                },
+            ],
+        });
+        let params = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shader_layer_params"),
+            layout: &layers.params_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(params_size),
+                }),
+            }],
+        });
+
+        let mut pass = begin_pass(encoder, frame_view, wgpu::LoadOp::Load, "shader_layer_pass");
+        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_bind_group(0, &content, &[]);
+        pass.set_bind_group(1, &params, &[]);
+        pass.set_scissor_rect(
+            scissor.origin.x.0 as u32,
+            scissor.origin.y.0 as u32,
+            scissor.size.width.0 as u32,
+            scissor.size.height.0 as u32,
+        );
+        pass.draw(0..4, 0..1);
+        Ok(())
+    }
+
+    fn shader_layer_pipeline(&mut self, shader: &CustomShader) -> Option<ShaderLayerPipeline> {
+        if let Some(pipeline) = self.resources.shader_layers.pipelines.get(&shader.id()) {
+            return pipeline.clone();
+        }
+        let pipeline = build_shader_layer_pipeline(
+            &self.resources.device,
+            &self.resources.shader_layers,
+            self.target_format,
+            shader,
+        )
+        .inspect_err(|error| log::error!("custom shader {shader:?} failed: {error:#}"))
+        .ok();
+        self.resources
+            .shader_layers
+            .pipelines
+            .insert(shader.id(), pipeline.clone());
+        pipeline
     }
 
     fn write_instances(
@@ -1684,18 +2082,25 @@ impl WgpuRendererCore {
     }
 
     fn prepare_texture_bind_groups(&mut self, scene: &Scene) {
-        let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
-        for batch in scene.batches() {
-            let texture_id = match batch {
-                PrimitiveBatch::MonochromeSprites { texture_id, .. }
-                | PrimitiveBatch::SubpixelSprites { texture_id, .. }
-                | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
-                _ => continue,
-            };
-            if !texture_ids.contains(&texture_id) {
-                texture_ids.push(texture_id);
+        fn collect(scene: &Scene, texture_ids: &mut SmallVec<[AtlasTextureId; 8]>) {
+            for batch in scene.batches() {
+                let texture_id = match batch {
+                    PrimitiveBatch::MonochromeSprites { texture_id, .. }
+                    | PrimitiveBatch::SubpixelSprites { texture_id, .. }
+                    | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+                    _ => continue,
+                };
+                if !texture_ids.contains(&texture_id) {
+                    texture_ids.push(texture_id);
+                }
+            }
+            for layer in &scene.shader_layers {
+                collect(&layer.scene, texture_ids);
             }
         }
+
+        let mut texture_ids = SmallVec::<[AtlasTextureId; 8]>::new();
+        collect(scene, &mut texture_ids);
 
         self.resources_mut()
             .atlas_texture_bind_groups
@@ -2581,6 +2986,183 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     }
 }
 
+fn begin_pass<'encoder>(
+    encoder: &'encoder mut wgpu::CommandEncoder,
+    view: &wgpu::TextureView,
+    load: wgpu::LoadOp<wgpu::Color>,
+    label: &str,
+) -> wgpu::RenderPass<'encoder> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    })
+}
+
+/// The whole device pixels `bounds` covers, clipped to the viewport.
+fn shader_layer_region(
+    bounds: Bounds<ScaledPixels>,
+    viewport_size: Size<DevicePixels>,
+) -> Option<Bounds<DevicePixels>> {
+    let left = (bounds.origin.x.0.round() as i32).max(0);
+    let top = (bounds.origin.y.0.round() as i32).max(0);
+    let right = (bounds.bottom_right().x.0.round() as i32).min(viewport_size.width.0);
+    let bottom = (bounds.bottom_right().y.0.round() as i32).min(viewport_size.height.0);
+    (right > left && bottom > top).then(|| Bounds {
+        origin: Point {
+            x: DevicePixels(left),
+            y: DevicePixels(top),
+        },
+        size: Size {
+            width: DevicePixels(right - left),
+            height: DevicePixels(bottom - top),
+        },
+    })
+}
+
+/// Check a custom shader against the interface [`CustomShader`] documents,
+/// returning its fragment entry point and the size of its uniform block.
+fn shader_layer_interface(module: &naga::Module) -> Result<(String, u64)> {
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx())?;
+    let mut uniform_size = 0;
+    for (_, global) in module.global_variables.iter() {
+        let Some(binding) = &global.binding else {
+            continue;
+        };
+        let supported = match (
+            binding.group,
+            binding.binding,
+            &module.types[global.ty].inner,
+        ) {
+            (
+                0,
+                0,
+                naga::TypeInner::Image {
+                    dim: naga::ImageDimension::D2,
+                    arrayed: false,
+                    class:
+                        naga::ImageClass::Sampled {
+                            kind: naga::ScalarKind::Float,
+                            multi: false,
+                        },
+                },
+            ) => true,
+            (0, 1, _) if global.space == naga::AddressSpace::Uniform => {
+                uniform_size = u64::from(layouter[global.ty].size);
+                true
+            }
+            (0, 2, naga::TypeInner::Sampler { comparison: false }) => true,
+            _ => false,
+        };
+        anyhow::ensure!(
+            supported,
+            "unsupported binding @group({}) @binding({})",
+            binding.group,
+            binding.binding
+        );
+    }
+
+    let entry_point = module
+        .entry_points
+        .iter()
+        .find(|entry_point| entry_point.stage == naga::ShaderStage::Fragment)
+        .context("no fragment entry point")?;
+    let is_layer_position =
+        |binding: &Option<naga::Binding>, ty: naga::Handle<naga::Type>| match binding {
+            Some(naga::Binding::BuiltIn(_)) => true,
+            Some(naga::Binding::Location { location: 0, .. }) => matches!(
+                module.types[ty].inner,
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Bi,
+                    scalar: naga::Scalar::F32,
+                }
+            ),
+            _ => false,
+        };
+    for argument in &entry_point.function.arguments {
+        let supported = match (&argument.binding, &module.types[argument.ty].inner) {
+            (None, naga::TypeInner::Struct { members, .. }) => members
+                .iter()
+                .all(|member| is_layer_position(&member.binding, member.ty)),
+            (binding, _) => is_layer_position(binding, argument.ty),
+        };
+        anyhow::ensure!(
+            supported,
+            "fragment inputs other than @location(0) vec2<f32> are not supplied"
+        );
+    }
+    Ok((entry_point.name.clone(), uniform_size))
+}
+
+fn build_shader_layer_pipeline(
+    device: &wgpu::Device,
+    layers: &ShaderLayerResources,
+    format: wgpu::TextureFormat,
+    shader: &CustomShader,
+) -> Result<ShaderLayerPipeline> {
+    let module = naga::front::wgsl::parse_str(shader.wgsl())
+        .map_err(|error| anyhow::anyhow!(error.emit_to_string(shader.wgsl())))?;
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)?;
+    let (entry_point, uniform_size) = shader_layer_interface(&module)?;
+
+    #[cfg(not(target_family = "wasm"))]
+    let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let fragment_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("custom_shader"),
+        source: wgpu::ShaderSource::Wgsl(shader.wgsl().into()),
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shader_layer"),
+        layout: Some(&layers.pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &layers.vertex_module,
+            entry_point: Some("shader_layer_vertex"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &fragment_module,
+            entry_point: Some(&entry_point),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(error) = gpui::block_on(error_scope.pop()) {
+        anyhow::bail!("{error}");
+    }
+    Ok(ShaderLayerPipeline {
+        pipeline,
+        uniform_size,
+    })
+}
+
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
@@ -2996,6 +3578,128 @@ mod tests {
                 (wgpu::Backends::VULKAN | wgpu::Backends::GL, true),
             ]
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod shader_layers {
+        use super::*;
+        use gpui::{PlatformHeadlessRenderer, ShaderLayer, hsla};
+
+        const SWAP_OR_TINT: &str = r#"
+@group(0) @binding(0) var content: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> tint: vec4<f32>;
+@group(0) @binding(2) var content_sampler: sampler;
+
+@fragment
+fn main(@location(0) position: vec2<f32>) -> @location(0) vec4<f32> {
+    let uv = position / vec2<f32>(textureDimensions(content));
+    let color = textureSample(content, content_sampler, uv);
+    if position.x < 8.0 {
+        return tint;
+    }
+    return color.bgra;
+}
+"#;
+
+        fn solid_quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+            Quad {
+                order: 0,
+                border_style: BorderStyle::Solid,
+                bounds,
+                content_mask: ContentMask { bounds },
+                background: color.into(),
+                border_color: color,
+                corner_radii: Corners::default(),
+                border_widths: Edges::default(),
+                corner_smoothing: 2.0,
+                pad: [0; 3],
+            }
+        }
+
+        fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+            Bounds {
+                origin: Point {
+                    x: x.into(),
+                    y: y.into(),
+                },
+                size: Size {
+                    width: width.into(),
+                    height: height.into(),
+                },
+            }
+        }
+
+        fn red_layer(shader: &str, inner: Option<ShaderLayer>) -> ShaderLayer {
+            let layer_bounds = bounds(8.0, 8.0, 16.0, 16.0);
+            let mut scene = Scene::default();
+            scene.insert_primitive(solid_quad(layer_bounds, hsla(0.0, 1.0, 0.5, 1.0)));
+            if let Some(inner) = inner {
+                scene.insert_primitive(inner);
+            }
+            scene.finish();
+            let tint: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+            ShaderLayer {
+                order: 0,
+                bounds: layer_bounds,
+                content_mask: ContentMask {
+                    bounds: layer_bounds,
+                },
+                shader: CustomShader::new(shader.to_owned()),
+                uniforms: bytemuck::cast_slice(&tint).into(),
+                scene: Rc::new(scene),
+            }
+        }
+
+        fn render(layer: ShaderLayer) -> anyhow::Result<image::RgbaImage> {
+            let mut renderer = WgpuHeadlessRenderer::new()?;
+            let mut scene = Scene::default();
+            scene.insert_primitive(solid_quad(
+                bounds(0.0, 0.0, 32.0, 32.0),
+                hsla(0.0, 0.0, 0.0, 1.0),
+            ));
+            scene.insert_primitive(layer);
+            scene.finish();
+            renderer.render_scene_to_image(
+                &scene,
+                Size {
+                    width: DevicePixels(32),
+                    height: DevicePixels(32),
+                },
+            )
+        }
+
+        #[test]
+        fn shader_layers_run_custom_shaders_over_their_content() -> anyhow::Result<()> {
+            let image = render(red_layer(SWAP_OR_TINT, None))?;
+            assert_eq!(image.get_pixel(4, 12).0, [0, 0, 0, 255]);
+            assert_eq!(image.get_pixel(10, 12).0, [0, 255, 0, 255]);
+            assert_eq!(image.get_pixel(20, 12).0, [0, 0, 255, 255]);
+            assert_eq!(image.get_pixel(28, 12).0, [0, 0, 0, 255]);
+            Ok(())
+        }
+
+        #[test]
+        fn nested_shader_layers_feed_the_outer_layer() -> anyhow::Result<()> {
+            let inner = red_layer(SWAP_OR_TINT, None);
+            let image = render(red_layer(SWAP_OR_TINT, Some(inner)))?;
+            assert_eq!(image.get_pixel(10, 12).0, [0, 255, 0, 255]);
+            assert_eq!(image.get_pixel(20, 12).0, [255, 0, 0, 255]);
+            Ok(())
+        }
+
+        #[test]
+        fn invalid_custom_shaders_paint_the_layer_unchanged() -> anyhow::Result<()> {
+            for shader in [
+                "not wgsl",
+                "@fragment fn main(@location(1) x: vec4<f32>) -> @location(0) vec4<f32> { return x; }",
+            ] {
+                let image = render(red_layer(shader, None))?;
+                assert_eq!(image.get_pixel(10, 12).0, [255, 0, 0, 255]);
+                assert_eq!(image.get_pixel(20, 12).0, [255, 0, 0, 255]);
+                assert_eq!(image.get_pixel(28, 12).0, [0, 0, 0, 255]);
+            }
+            Ok(())
+        }
     }
 
     #[test]

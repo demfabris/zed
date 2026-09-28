@@ -871,6 +871,31 @@ fragment float4 path_sprite_fragment(
   return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
 }
 
+struct ShaderLayerVertexOutput {
+  float4 position [[position]];
+  float2 layer_position [[user(loc0)]];
+  float clip_distance [[clip_distance]][4];
+};
+
+vertex ShaderLayerVertexOutput shader_layer_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(ShaderLayerInputIndex_Vertices)]],
+    constant ShaderLayerBounds *layer [[buffer(ShaderLayerInputIndex_Bounds)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(ShaderLayerInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float4 device_position =
+      to_device_position(unit_vertex, layer->bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, layer->bounds,
+                                                 layer->content_mask.bounds);
+  float2 layer_position =
+      unit_vertex * float2(layer->bounds.size.width, layer->bounds.size.height);
+  return ShaderLayerVertexOutput{
+      device_position,
+      layer_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;

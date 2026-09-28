@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, CustomShader, DevicePixels, PaintSurface,
+    Path, Point, PrimitiveBatch, ScaledPixels, Scene, ShaderLayer, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -27,7 +27,10 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell, collections::HashMap, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice,
+    sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -131,6 +134,12 @@ pub struct MetalRenderer {
     surfaces_pipeline_state: metal::RenderPipelineState,
     bgra_surfaces_pipeline_state: metal::RenderPipelineState,
     hole_surfaces_pipeline_state: metal::RenderPipelineState,
+    shader_layer_vertex: metal::Function,
+    shader_layer_sampler: metal::SamplerState,
+    shader_layer_pipelines: HashMap<u64, Option<ShaderLayerPipeline>>,
+    shader_layer_targets: Vec<metal::Texture>,
+    shader_layer_inputs: Vec<metal::Texture>,
+    shader_layers_drawn: bool,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -345,6 +354,16 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
 
+        let shader_layer_vertex = library
+            .get_function("shader_layer_vertex", None)
+            .expect("error locating vertex function");
+        let sampler_descriptor = metal::SamplerDescriptor::new();
+        sampler_descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+        sampler_descriptor.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+        sampler_descriptor.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
+        sampler_descriptor.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
+        let shader_layer_sampler = device.new_sampler(&sampler_descriptor);
+
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
@@ -369,6 +388,12 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             bgra_surfaces_pipeline_state,
             hole_surfaces_pipeline_state,
+            shader_layer_vertex,
+            shader_layer_sampler,
+            shader_layer_pipelines: HashMap::default(),
+            shader_layer_targets: Vec::new(),
+            shader_layer_inputs: Vec::new(),
+            shader_layers_drawn: false,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -555,6 +580,7 @@ impl MetalRenderer {
             )
         })?;
         let atlas_frame = self.sprite_atlas.begin_frame();
+        self.shader_layers_drawn = false;
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
@@ -562,6 +588,10 @@ impl MetalRenderer {
             texture,
             viewport_size,
         )?;
+        if !self.shader_layers_drawn {
+            self.shader_layer_targets.clear();
+            self.shader_layer_inputs.clear();
+        }
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -714,13 +744,32 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.layer_opaque() { 1. } else { 0. };
-
-        let mut command_encoder = new_command_encoder_for_texture(
+        self.encode_scene(
             command_buffer,
+            scene,
+            instance_bindings,
+            writer,
             texture,
             viewport_size,
             Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
-        );
+            0,
+        )?;
+        Ok(command_buffer.to_owned())
+    }
+
+    fn encode_scene(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        scene: &Scene,
+        instance_bindings: &InstanceBindings,
+        writer: &mut InstanceBufferWriter,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        clear_color: Option<metal::MTLClearColor>,
+        depth: usize,
+    ) -> Result<()> {
+        let mut command_encoder =
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, clear_color);
 
         for batch in scene.batches() {
             match batch {
@@ -786,13 +835,205 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::ShaderLayers(range) => {
+                    command_encoder.end_encoding();
+                    for layer in &scene.shader_layers[range] {
+                        self.draw_shader_layer(
+                            layer,
+                            command_buffer,
+                            writer,
+                            texture,
+                            viewport_size,
+                            depth,
+                        )?;
+                    }
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    );
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
 
         command_encoder.end_encoding();
 
-        Ok(command_buffer.to_owned())
+        Ok(())
+    }
+
+    fn draw_shader_layer(
+        &mut self,
+        layer: &ShaderLayer,
+        command_buffer: &metal::CommandBufferRef,
+        writer: &mut InstanceBufferWriter,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        depth: usize,
+    ) -> Result<()> {
+        let Some(region) = shader_layer_region(layer.bounds, viewport_size) else {
+            return Ok(());
+        };
+        let instance_bindings = write_instances(&layer.scene, writer)?;
+        let Some(pipeline) = self.shader_layer_pipeline(&layer.shader) else {
+            return self.encode_scene(
+                command_buffer,
+                &layer.scene,
+                &instance_bindings,
+                writer,
+                texture,
+                viewport_size,
+                None,
+                depth + 1,
+            );
+        };
+        self.shader_layers_drawn = true;
+
+        let target = self.shader_layer_target(depth, viewport_size);
+        self.encode_scene(
+            command_buffer,
+            &layer.scene,
+            &instance_bindings,
+            writer,
+            &target,
+            viewport_size,
+            Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
+            depth + 1,
+        )?;
+
+        let input = self.shader_layer_input(region.size);
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            &target,
+            0,
+            0,
+            metal::MTLOrigin {
+                x: region.origin.x.0 as u64,
+                y: region.origin.y.0 as u64,
+                z: 0,
+            },
+            metal::MTLSize {
+                width: region.size.width.0 as u64,
+                height: region.size.height.0 as u64,
+                depth: 1,
+            },
+            &input,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+
+        let uniforms = if pipeline.uniform_size > 0 {
+            let mut bytes = vec![0u8; pipeline.uniform_size];
+            let len = layer.uniforms.len().min(bytes.len());
+            bytes[..len].copy_from_slice(&layer.uniforms[..len]);
+            Some(writer.write(&bytes)?)
+        } else {
+            None
+        };
+
+        let bounds = ShaderLayerBounds {
+            bounds: Bounds {
+                origin: point(
+                    ScaledPixels(region.origin.x.0 as f32),
+                    ScaledPixels(region.origin.y.0 as f32),
+                ),
+                size: size(
+                    ScaledPixels(region.size.width.0 as f32),
+                    ScaledPixels(region.size.height.0 as f32),
+                ),
+            },
+            content_mask: layer.content_mask,
+        };
+        let command_encoder =
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, None);
+        command_encoder.set_render_pipeline_state(&pipeline.state);
+        command_encoder.set_vertex_buffer(
+            ShaderLayerInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_bytes(
+            ShaderLayerInputIndex::Bounds as u64,
+            mem::size_of_val(&bounds) as u64,
+            &bounds as *const ShaderLayerBounds as *const _,
+        );
+        command_encoder.set_vertex_bytes(
+            ShaderLayerInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(0, Some(&input));
+        command_encoder.set_fragment_sampler_state(0, Some(&self.shader_layer_sampler));
+        if let Some(uniforms) = &uniforms {
+            command_encoder.set_fragment_buffer(0, Some(&uniforms.buffer), uniforms.offset as u64);
+        }
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        command_encoder.end_encoding();
+        Ok(())
+    }
+
+    fn shader_layer_pipeline(&mut self, shader: &CustomShader) -> Option<ShaderLayerPipeline> {
+        if let Some(pipeline) = self.shader_layer_pipelines.get(&shader.id()) {
+            return pipeline.clone();
+        }
+        let pipeline = build_shader_layer_pipeline(&self.device, &self.shader_layer_vertex, shader)
+            .inspect_err(|error| log::error!("custom shader {shader:?} failed: {error:#}"))
+            .ok();
+        self.shader_layer_pipelines
+            .insert(shader.id(), pipeline.clone());
+        pipeline
+    }
+
+    fn shader_layer_target(&mut self, depth: usize, size: Size<DevicePixels>) -> metal::Texture {
+        let stale = self
+            .shader_layer_targets
+            .first()
+            .is_some_and(|texture| !texture_has_size(texture, size));
+        if stale {
+            self.shader_layer_targets.clear();
+        }
+        while self.shader_layer_targets.len() <= depth {
+            let texture = self.new_shader_layer_texture(size, true);
+            self.shader_layer_targets.push(texture);
+        }
+        self.shader_layer_targets[depth].clone()
+    }
+
+    fn shader_layer_input(&mut self, size: Size<DevicePixels>) -> metal::Texture {
+        if let Some(texture) = self
+            .shader_layer_inputs
+            .iter()
+            .find(|texture| texture_has_size(texture, size))
+        {
+            return texture.clone();
+        }
+        if self.shader_layer_inputs.len() >= MAX_SHADER_LAYER_INPUTS {
+            self.shader_layer_inputs.clear();
+        }
+        let texture = self.new_shader_layer_texture(size, false);
+        self.shader_layer_inputs.push(texture.clone());
+        texture
+    }
+
+    fn new_shader_layer_texture(
+        &self,
+        size: Size<DevicePixels>,
+        render_target: bool,
+    ) -> metal::Texture {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor.set_usage(if render_target {
+            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead
+        } else {
+            metal::MTLTextureUsage::ShaderRead
+        });
+        self.device.new_texture(&descriptor)
     }
 
     fn draw_paths_to_intermediate(
@@ -1718,6 +1959,13 @@ enum SurfaceInputIndex {
 }
 
 #[repr(C)]
+enum ShaderLayerInputIndex {
+    Vertices = 0,
+    Bounds = 1,
+    ViewportSize = 2,
+}
+
+#[repr(C)]
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
@@ -1727,6 +1975,147 @@ enum PathRasterizationInputIndex {
 #[repr(C)]
 pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[repr(C)]
+pub struct ShaderLayerBounds {
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[derive(Clone)]
+struct ShaderLayerPipeline {
+    state: metal::RenderPipelineState,
+    uniform_size: usize,
+}
+
+const MAX_SHADER_LAYER_INPUTS: usize = 8;
+
+fn texture_has_size(texture: &metal::TextureRef, size: Size<DevicePixels>) -> bool {
+    texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+}
+
+/// The whole device pixels a layer covers, clipped to the viewport.
+fn shader_layer_region(
+    bounds: Bounds<ScaledPixels>,
+    viewport_size: Size<DevicePixels>,
+) -> Option<Bounds<DevicePixels>> {
+    let left = (bounds.origin.x.0.round() as i32).max(0);
+    let top = (bounds.origin.y.0.round() as i32).max(0);
+    let right = (bounds.bottom_right().x.0.round() as i32).min(viewport_size.width.0);
+    let bottom = (bounds.bottom_right().y.0.round() as i32).min(viewport_size.height.0);
+    (right > left && bottom > top).then(|| Bounds {
+        origin: point(DevicePixels(left), DevicePixels(top)),
+        size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
+    })
+}
+
+fn build_shader_layer_pipeline(
+    device: &metal::DeviceRef,
+    vertex_fn: &metal::FunctionRef,
+    shader: &CustomShader,
+) -> Result<ShaderLayerPipeline> {
+    use naga::back::msl;
+
+    let module = naga::front::wgsl::parse_str(shader.wgsl())
+        .map_err(|error| anyhow::anyhow!(error.emit_to_string(shader.wgsl())))?;
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)?;
+    let entry_point = module
+        .entry_points
+        .iter()
+        .find(|entry_point| entry_point.stage == naga::ShaderStage::Fragment)
+        .context("no fragment entry point")?;
+
+    let mut uniform_size = 0;
+    let mut resources = msl::BindingMap::default();
+    let mut layouter = naga::proc::Layouter::default();
+    layouter.update(module.to_ctx())?;
+    for (_, global) in module.global_variables.iter() {
+        let Some(binding) = &global.binding else {
+            continue;
+        };
+        let target = match (binding.group, binding.binding, global.space) {
+            (0, 0, naga::AddressSpace::Handle) => msl::BindTarget {
+                texture: Some(0),
+                ..Default::default()
+            },
+            (0, 1, naga::AddressSpace::Uniform) => {
+                uniform_size = layouter[global.ty].size as usize;
+                msl::BindTarget {
+                    buffer: Some(0),
+                    ..Default::default()
+                }
+            }
+            (0, 2, naga::AddressSpace::Handle) => msl::BindTarget {
+                sampler: Some(msl::BindSamplerTarget::Resource(0)),
+                ..Default::default()
+            },
+            _ => anyhow::bail!(
+                "unsupported binding @group({}) @binding({})",
+                binding.group,
+                binding.binding
+            ),
+        };
+        resources.insert(*binding, target);
+    }
+    let mut per_entry_point_map = msl::EntryPointResourceMap::default();
+    per_entry_point_map.insert(
+        entry_point.name.clone(),
+        msl::EntryPointResources {
+            resources,
+            ..Default::default()
+        },
+    );
+    let options = msl::Options {
+        lang_version: (2, 4),
+        per_entry_point_map,
+        fake_missing_bindings: false,
+        ..Default::default()
+    };
+    let pipeline_options = msl::PipelineOptions {
+        entry_point: Some((naga::ShaderStage::Fragment, entry_point.name.clone())),
+        ..Default::default()
+    };
+    let (source, translation) = msl::write_string(&module, &info, &options, &pipeline_options)?;
+    let fragment_name = translation
+        .entry_point_names
+        .into_iter()
+        .next()
+        .context("no translated entry point")?
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let library = device
+        .new_library_with_source(&source, &metal::CompileOptions::new())
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let fragment_fn = library
+        .get_function(&fragment_name, None)
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label("shader_layer");
+    descriptor.set_vertex_function(Some(vertex_fn));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    let state = device
+        .new_render_pipeline_state(&descriptor)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(ShaderLayerPipeline {
+        state,
+        uniform_size,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1875,6 +2264,95 @@ mod tests {
         Ok(())
     }
 
+    const SWAP_OR_TINT: &str = r#"
+@group(0) @binding(0) var content: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> tint: vec4<f32>;
+@group(0) @binding(2) var content_sampler: sampler;
+
+@fragment
+fn main(@location(0) position: vec2<f32>) -> @location(0) vec4<f32> {
+    let uv = position / vec2<f32>(textureDimensions(content));
+    let color = textureSample(content, content_sampler, uv);
+    if position.x < 8.0 {
+        return tint;
+    }
+    return color.bgra;
+}
+"#;
+
+    fn solid_quad(bounds: Bounds<ScaledPixels>, color: gpui::Hsla) -> Quad {
+        let mut quad = Quad::default();
+        quad.bounds = bounds;
+        quad.content_mask.bounds = bounds;
+        quad.background = color.into();
+        quad
+    }
+
+    fn red_layer(
+        bounds: Bounds<ScaledPixels>,
+        shader: &str,
+        inner: Option<ShaderLayer>,
+    ) -> ShaderLayer {
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(bounds, hsla(0.0, 1.0, 0.5, 1.0)));
+        if let Some(inner) = inner {
+            scene.insert_primitive(inner);
+        }
+        scene.finish();
+        let tint: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+        ShaderLayer {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            shader: CustomShader::new(shader.to_owned()),
+            uniforms: tint.iter().flat_map(|value| value.to_ne_bytes()).collect(),
+            scene: std::rc::Rc::new(scene),
+        }
+    }
+
+    fn render_layer(layer: ShaderLayer) -> Result<RgbaImage> {
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let target = Bounds::new(point(px(0.0), px(0.0)), size(px(32.0), px(32.0))).scale(1.0);
+        let mut scene = Scene::default();
+        scene.insert_primitive(solid_quad(target, hsla(0.0, 0.0, 0.0, 1.0)));
+        scene.insert_primitive(layer);
+        scene.finish();
+        renderer.render_scene_to_image(&scene, size(32.into(), 32.into()))
+    }
+
+    fn layer_bounds() -> Bounds<ScaledPixels> {
+        Bounds::new(point(px(8.0), px(8.0)), size(px(16.0), px(16.0))).scale(1.0)
+    }
+
+    #[test]
+    fn shader_layers_run_custom_shaders_over_their_content() -> Result<()> {
+        let image = render_layer(red_layer(layer_bounds(), SWAP_OR_TINT, None))?;
+        assert_eq!(image.get_pixel(4, 12).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(10, 12).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(20, 12).0, [0, 0, 255, 255]);
+        assert_eq!(image.get_pixel(28, 12).0, [0, 0, 0, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn nested_shader_layers_feed_the_outer_layer() -> Result<()> {
+        let inner = red_layer(layer_bounds(), SWAP_OR_TINT, None);
+        let image = render_layer(red_layer(layer_bounds(), SWAP_OR_TINT, Some(inner)))?;
+        assert_eq!(image.get_pixel(10, 12).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(20, 12).0, [255, 0, 0, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_custom_shaders_paint_the_layer_unchanged() -> Result<()> {
+        let image = render_layer(red_layer(layer_bounds(), "not wgsl", None))?;
+        assert_eq!(image.get_pixel(10, 12).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(20, 12).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(28, 12).0, [0, 0, 0, 255]);
+        Ok(())
+    }
+
     #[test]
     fn translucent_layers_preserve_source_over_alpha() -> Result<()> {
         let mut renderer =
@@ -1992,3 +2470,4 @@ mod tests {
         Ok(())
     }
 }
+

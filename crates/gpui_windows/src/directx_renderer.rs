@@ -357,6 +357,12 @@ impl DirectXRenderer {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
         })?;
+        self.draw_scene(scene)
+    }
+
+    /// Custom shaders are not compiled here, so a shader layer's content is
+    /// drawn in place, unchanged.
+    fn draw_scene(&mut self, scene: &Scene) -> Result<()> {
         self.upload_scene_buffers(scene)?;
 
         let annotation = self
@@ -389,6 +395,12 @@ impl DirectXRenderer {
                 PrimitiveBatch::Surfaces(range) => {
                     let start = range.start;
                     self.draw_surfaces(start, &scene.surfaces[range])
+                }
+                PrimitiveBatch::ShaderLayers(range) => {
+                    for layer in &scene.shader_layers[range] {
+                        self.draw_scene(&layer.scene)?;
+                    }
+                    self.upload_scene_buffers(scene)
                 }
             }
             .with_context(|| {
