@@ -173,6 +173,9 @@ impl WgpuContext {
         any(test, feature = "bench-support", feature = "test-support")
     ))]
     pub(crate) fn new_headless() -> anyhow::Result<(Self, wgpu::TextureFormat)> {
+        #[cfg(target_os = "macos")]
+        let instance = Self::instance_with_backends(None, wgpu::Backends::METAL);
+        #[cfg(not(target_os = "macos"))]
         let instance = Self::instance(None);
         let device_id_filter = Self::device_id_filter();
         let (adapter, device, queue, dual_source_blending, color_texture_format, target_format) =
