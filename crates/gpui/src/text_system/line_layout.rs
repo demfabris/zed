@@ -617,6 +617,7 @@ impl LineLayoutCache {
             font_size,
             runs,
             wrap_width,
+            max_lines,
             force_width: None,
         } as &dyn AsCacheKeyRef;
 
@@ -652,6 +653,7 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width,
+                max_lines,
                 force_width: None,
             });
 
@@ -682,6 +684,7 @@ impl LineLayoutCache {
             font_size,
             runs,
             wrap_width: None,
+            max_lines: None,
             force_width,
         } as &dyn AsCacheKeyRef;
 
@@ -710,6 +713,7 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
+                max_lines: None,
                 force_width,
             });
             let layout = Arc::new(layout);
@@ -939,6 +943,7 @@ struct CacheKey {
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
+    max_lines: Option<usize>,
     force_width: Option<Pixels>,
 }
 
@@ -948,6 +953,7 @@ struct CacheKeyRef<'a> {
     font_size: Pixels,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
+    max_lines: Option<usize>,
     force_width: Option<Pixels>,
 }
 
@@ -1040,6 +1046,7 @@ impl AsCacheKeyRef for CacheKey {
             font_size: self.font_size,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
+            max_lines: self.max_lines,
             force_width: self.force_width,
         }
     }
@@ -1073,6 +1080,36 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 mod tests {
     use super::*;
     use crate::GlyphId;
+
+    #[test]
+    fn wrapped_line_cache_separates_line_clamps() {
+        let text = "one two three four five";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(1),
+        }];
+        for first_clamp in [None, Some(1), Some(2)] {
+            let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem), Arc::default());
+            let first =
+                cache.layout_wrapped_line(text, px(16.0), &runs, Some(px(30.0)), first_clamp);
+            for max_lines in [None, Some(1), Some(2)] {
+                let line =
+                    cache.layout_wrapped_line(text, px(16.0), &runs, Some(px(30.0)), max_lines);
+                let expected_boundaries = match max_lines {
+                    None => cache
+                        .layout_line(text, px(16.0), &runs, None)
+                        .compute_wrap_boundaries(text, px(30.0), None)
+                        .len(),
+                    Some(lines) => lines - 1,
+                };
+                assert_eq!(line.wrap_boundaries.len(), expected_boundaries);
+                assert_eq!(Arc::ptr_eq(&first, &line), first_clamp == max_lines);
+            }
+            cache.finish_frame();
+            let line = cache.layout_wrapped_line(text, px(16.0), &runs, Some(px(30.0)), Some(1));
+            assert!(line.wrap_boundaries.is_empty());
+        }
+    }
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
