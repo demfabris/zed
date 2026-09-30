@@ -3207,6 +3207,14 @@ impl Window {
         }
     }
 
+    pub(crate) fn text_align(&self) -> crate::TextAlign {
+        (&self.text_style_stack)
+            .into_iter()
+            .rev()
+            .find_map(|refinement| refinement.text_align)
+            .unwrap_or_default()
+    }
+
     /// The line height associated with the current text style.
     pub fn line_height(&self) -> Pixels {
         self.text_style().line_height_in_pixels(self.rem_size())
@@ -8308,6 +8316,42 @@ mod tests {
     };
 
     use super::window_corner_mask_for_viewport;
+
+    #[gpui::test]
+    fn text_alignment_follows_refinements_and_restored_snapshots(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        cx.update_window(window.into(), |_, window, _| {
+            let aligned = |alignment| crate::TextStyleRefinement {
+                text_align: Some(alignment),
+                ..Default::default()
+            };
+            assert_eq!(window.text_align(), window.text_style().text_align);
+            window
+                .text_style_stack
+                .push(aligned(crate::TextAlign::Right));
+            window.text_style_stack.push(crate::TextStyleRefinement {
+                font_size: Some(px(10.).into()),
+                ..Default::default()
+            });
+            let deferred = window.text_style_stack.clone();
+            assert_eq!(window.text_align(), crate::TextAlign::Right);
+            assert_eq!(window.text_align(), window.text_style().text_align);
+            window
+                .text_style_stack
+                .push(aligned(crate::TextAlign::Center));
+            assert_eq!(window.text_align(), crate::TextAlign::Center);
+            assert_eq!(window.text_align(), window.text_style().text_align);
+            window.text_style_stack.pop();
+            assert_eq!(window.text_align(), crate::TextAlign::Right);
+            window.text_style_stack.clear();
+            assert_eq!(window.text_align(), crate::TextAlign::Left);
+            window.text_style_stack.clone_from(&deferred);
+            assert_eq!(window.text_align(), crate::TextAlign::Right);
+            assert_eq!(window.text_align(), window.text_style().text_align);
+            window.text_style_stack.clear();
+        })
+        .unwrap();
+    }
 
     #[gpui::test]
     fn element_corner_radius_mode_preserves_fixed_radii(cx: &mut TestAppContext) {
