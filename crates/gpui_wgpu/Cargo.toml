@@ -52,6 +52,11 @@ criterion.workspace = true
 gpui = { workspace = true, features = ["bench-support"] }
 image.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+wayland-backend = { version = "0.3.15", features = ["client_system", "dlopen", "rwh_06"] }
+wayland-client = "0.31.11"
+wayland-protocols = { version = "0.32.9", features = ["client"] }
+
 [[bench]]
 name = "layout_line"
 harness = false

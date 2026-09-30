@@ -1360,6 +1360,11 @@ impl WgpuRenderer {
             wgpu::Color::TRANSPARENT,
         ) {
             log::error!("{error:#}");
+            // Dropping an acquired image does not release native Vulkan
+            // swapchain images. Reconfigure after all texture views are gone.
+            drop(frame_view);
+            drop(frame);
+            surface.configure(&core.resources.device, &self.surface_config);
             return false;
         }
 
@@ -3356,6 +3361,145 @@ mod tests {
     const BLUE: [u8; 4] = [0, 0, 255, 255];
     #[cfg(target_os = "linux")]
     const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    #[cfg(target_os = "linux")]
+    mod wayland {
+        use super::*;
+        use wayland_client::{
+            Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
+            globals::{GlobalListContents, registry_queue_init},
+            protocol::{wl_compositor, wl_registry, wl_surface},
+        };
+        use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+
+        #[derive(Default)]
+        struct State {
+            configured: bool,
+        }
+
+        impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+            fn event(
+                _: &mut Self,
+                _: &wl_registry::WlRegistry,
+                _: wl_registry::Event,
+                _: &GlobalListContents,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+            }
+        }
+
+        impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
+            fn event(
+                _: &mut Self,
+                proxy: &xdg_wm_base::XdgWmBase,
+                event: xdg_wm_base::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_wm_base::Event::Ping { serial } = event {
+                    proxy.pong(serial);
+                }
+            }
+        }
+
+        impl Dispatch<xdg_surface::XdgSurface, ()> for State {
+            fn event(
+                state: &mut Self,
+                proxy: &xdg_surface::XdgSurface,
+                event: xdg_surface::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_surface::Event::Configure { serial } = event {
+                    proxy.ack_configure(serial);
+                    state.configured = true;
+                }
+            }
+        }
+
+        delegate_noop!(State: ignore wl_compositor::WlCompositor);
+        delegate_noop!(State: ignore wl_surface::WlSurface);
+        delegate_noop!(State: ignore xdg_toplevel::XdgToplevel);
+
+        #[test]
+        #[ignore = "requires a live Wayland compositor and Vulkan adapter"]
+        fn failed_frame_releases_acquired_swapchain_images() -> anyhow::Result<()> {
+            let connection = Connection::connect_to_env()?;
+            let (globals, mut events) = registry_queue_init::<State>(&connection)?;
+            let qh = events.handle();
+            let compositor = globals.bind::<wl_compositor::WlCompositor, _, _>(&qh, 1..=4, ())?;
+            let shell = globals.bind::<xdg_wm_base::XdgWmBase, _, _>(&qh, 1..=1, ())?;
+            let surface = compositor.create_surface(&qh, ());
+            let shell_surface = shell.get_xdg_surface(&surface, &qh, ());
+            let toplevel = shell_surface.get_toplevel(&qh, ());
+            toplevel.set_title("GPUI frame recovery regression".into());
+            shell_surface.set_window_geometry(0, 0, 128, 128);
+            surface.commit();
+            let mut state = State::default();
+            events.roundtrip(&mut state)?;
+            anyhow::ensure!(state.configured, "compositor did not configure the test window");
+
+            let instance = WgpuContext::instance_with_backends(
+                Some(Box::new(connection.backend())),
+                wgpu::Backends::VULKAN,
+            );
+            let window = std::ptr::NonNull::new(surface.id().as_ptr().cast())
+                .context("Wayland surface pointer")?;
+            let gpu_surface = create_surface(
+                &instance,
+                raw_window_handle::RawWindowHandle::Wayland(
+                    raw_window_handle::WaylandWindowHandle::new(window),
+                ),
+            )?;
+            let context = WgpuContext::new(instance, &gpu_surface, None)?;
+            let adapter = context.adapter.get_info();
+            assert_eq!(adapter.backend, wgpu::Backend::Vulkan);
+            eprintln!("frame recovery test adapter: {adapter:?}");
+            let mut renderer = WgpuRenderer::new_internal(
+                None,
+                &context,
+                gpu_surface,
+                WgpuSurfaceConfig {
+                    size: device_size(128, 128),
+                    transparent: false,
+                    preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                },
+                None,
+                Arc::new(WgpuAtlas::from_context(&context)),
+            )?;
+            let mut scene = Scene::default();
+            scene.insert_primitive(solid_quad(0.0, 0.0, 128.0, 128.0, gpui::red()));
+            scene.finish();
+            assert!(renderer.draw(&scene), "initial healthy frame failed");
+            events.roundtrip(&mut state)?;
+
+            for attempt in 0..8 {
+                let core = renderer.core_mut().context("ready renderer")?;
+                let capacity = core.instance_data_capacity;
+                let maximum = core.max_instance_data_size;
+                core.instance_data_capacity = 0;
+                core.max_instance_data_size = 0;
+                assert!(!renderer.draw(&scene), "capacity error was not reported");
+                let core = renderer.core_mut().context("ready renderer")?;
+                core.instance_data_capacity = capacity;
+                core.max_instance_data_size = maximum;
+                assert!(renderer.draw(&scene), "healthy frame after error {attempt} failed");
+                events.roundtrip(&mut state)?;
+                eprintln!("frame recovery attempt {attempt}: healthy frame presented");
+            }
+            let mut error_generation = 0;
+            assert!(context.errors().observe_error(&mut error_generation).is_none());
+            drop(renderer);
+            toplevel.destroy();
+            shell_surface.destroy();
+            surface.destroy();
+            connection.flush()?;
+            Ok(())
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
