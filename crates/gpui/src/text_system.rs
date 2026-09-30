@@ -403,6 +403,16 @@ impl TextSystem {
             return font_id;
         }
         for fallback in &self.fallback_font_stack {
+            let as_asked = Font {
+                family: fallback.family.clone(),
+                features: font.features.clone(),
+                fallbacks: font.fallbacks.clone(),
+                weight: font.weight,
+                style: font.style,
+            };
+            if let Ok(font_id) = self.font_id(&as_asked) {
+                return font_id;
+            }
             if let Ok(font_id) = self.font_id(fallback) {
                 return font_id;
             }
@@ -1517,6 +1527,61 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod font_resolution_tests {
+    use super::*;
+    use crate::NoopTextSystem;
+
+    #[test]
+    fn missing_primary_font_preserves_requested_fallback_attributes() {
+        let featured = Font {
+            features: FontFeatures(Arc::new(vec![("tnum".into(), 1)])),
+            fallbacks: Some(FontFallbacks::from_fonts(vec!["Emoji Test".into()])),
+            ..font("Missing Primary").bold().italic()
+        };
+        for requested in [
+            font("Missing Primary").bold(),
+            font("Missing Primary").italic(),
+            featured,
+        ] {
+            let text_system = TextSystem::new(Arc::new(NoopTextSystem));
+            let fallback = text_system.fallback_font_stack[0].clone();
+            let styled_fallback = Font {
+                family: fallback.family.clone(),
+                ..requested.clone()
+            };
+            {
+                let mut ids = text_system.font_ids_by_font.write();
+                ids.insert(requested.clone(), Err(anyhow!("missing primary font")));
+                ids.insert(fallback, Ok(FontId(10)));
+                ids.insert(styled_fallback, Ok(FontId(20)));
+            }
+
+            assert_eq!(text_system.resolve_font(&requested), FontId(20));
+            assert_eq!(text_system.resolve_font(&requested), FontId(20));
+        }
+    }
+
+    #[test]
+    fn missing_styled_fallback_still_resolves_the_plain_fallback() {
+        let requested = font("Missing Primary").bold().italic();
+        let text_system = TextSystem::new(Arc::new(NoopTextSystem));
+        let fallback = text_system.fallback_font_stack[0].clone();
+        let styled_fallback = Font {
+            family: fallback.family.clone(),
+            ..requested.clone()
+        };
+        {
+            let mut ids = text_system.font_ids_by_font.write();
+            ids.insert(requested.clone(), Err(anyhow!("missing primary font")));
+            ids.insert(styled_fallback, Err(anyhow!("missing fallback style")));
+            ids.insert(fallback, Ok(FontId(10)));
+        }
+
+        assert_eq!(text_system.resolve_font(&requested), FontId(10));
     }
 }
 
