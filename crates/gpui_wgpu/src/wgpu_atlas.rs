@@ -131,6 +131,29 @@ impl AtlasBackend for WgpuAtlasTextures {
         size: Size<DevicePixels>,
         bytes: &[u8],
     ) -> Result<AtlasTile> {
+        anyhow::ensure!(
+            size.width.0 > 0 && size.height.0 > 0,
+            "{kind:?} atlas upload requires positive dimensions, got {size:?}"
+        );
+        anyhow::ensure!(
+            size.width.0 as u32 <= self.max_texture_size
+                && size.height.0 as u32 <= self.max_texture_size,
+            "atlas tile {size:?} exceeds the device texture limit {}",
+            self.max_texture_size
+        );
+        let channels = match kind {
+            AtlasTextureKind::Monochrome => 1,
+            AtlasTextureKind::Polychrome | AtlasTextureKind::Subpixel => 4,
+        };
+        let expected = (size.width.0 as usize)
+            .checked_mul(size.height.0 as usize)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| anyhow::anyhow!("atlas upload byte count overflow for {size:?}"))?;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "{kind:?} atlas upload for {size:?} requires {expected} bytes, got {}",
+            bytes.len()
+        );
         let tile = self.allocate(size, kind).context("failed to allocate")?;
         self.upload_texture(tile.texture_id, tile.bounds, bytes);
         Ok(tile)
@@ -416,6 +439,7 @@ mod tests {
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to request adapter: {error}"))?;
+            eprintln!("atlas test adapter: {:?}", adapter.get_info());
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("wgpu_atlas_test_device"),
@@ -431,6 +455,85 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
             Ok((Arc::new(device), Arc::new(queue)))
         })
+    }
+
+    #[test]
+    fn invalid_uploads_do_not_allocate_or_cache_tiles() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+
+        for (index, (width, height, bytes)) in [
+            (1, 1, vec![0; 3]),
+            (1, 1, vec![0; 5]),
+            (0, 1, Vec::new()),
+            (-1, 1, Vec::new()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(index),
+                frame_index: 0,
+            });
+            let size = Size {
+                width: DevicePixels(width),
+                height: DevicePixels(height),
+            };
+            let result = atlas
+                .get_or_insert_with(key.clone(), &mut || Ok(Some((size, Cow::Borrowed(&bytes)))));
+            assert!(
+                result.is_err(),
+                "{size:?} with {} bytes was accepted",
+                bytes.len()
+            );
+            let state = atlas.0.lock();
+            assert!(!state.contains(&key));
+            assert!(
+                state
+                    .backend
+                    .storage
+                    .polychrome_textures
+                    .textures
+                    .is_empty()
+            );
+            assert!(state.backend.pending_uploads.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_upload_does_not_allocate_a_backing_texture() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        let width = atlas.0.lock().backend.max_texture_size as i32 + 1;
+        let size = Size {
+            width: DevicePixels(width),
+            height: DevicePixels(1),
+        };
+        let bytes = vec![0; width as usize * 4];
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(0),
+            frame_index: 0,
+        });
+        assert!(
+            atlas
+                .get_or_insert_with(key.clone(), &mut || {
+                    Ok(Some((size, Cow::Borrowed(&bytes))))
+                })
+                .is_err()
+        );
+        let state = atlas.0.lock();
+        assert!(!state.contains(&key));
+        assert!(
+            state
+                .backend
+                .storage
+                .polychrome_textures
+                .textures
+                .is_empty()
+        );
+        assert!(state.backend.pending_uploads.is_empty());
+        Ok(())
     }
 
     #[test]
