@@ -58,7 +58,6 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
-    mem,
     ops::Range,
     rc::Rc,
 };
@@ -111,6 +110,8 @@ impl ReusedSubtree {
         self.contains_focus
     }
 }
+
+mod reuse;
 
 #[derive(Default, Debug)]
 pub(crate) struct Replay {
@@ -243,6 +244,7 @@ impl DispatchTree {
         self.node_stack.pop();
     }
 
+    #[cfg(test)]
     fn move_node(&mut self, source: &mut DispatchNode) {
         self.push_node();
         if let Some(context) = source.context.clone() {
@@ -256,9 +258,10 @@ impl DispatchTree {
         }
 
         let target = self.active_node();
-        target.key_listeners = mem::take(&mut source.key_listeners);
-        target.action_listeners = mem::take(&mut source.action_listeners);
-        target.modifiers_changed_listeners = mem::take(&mut source.modifiers_changed_listeners);
+        target.key_listeners = std::mem::take(&mut source.key_listeners);
+        target.action_listeners = std::mem::take(&mut source.action_listeners);
+        target.modifiers_changed_listeners =
+            std::mem::take(&mut source.modifiers_changed_listeners);
     }
 
     pub fn reuse_subtree(
@@ -269,36 +272,7 @@ impl DispatchTree {
     ) -> ReusedSubtree {
         let new_range = self.nodes.len()..self.nodes.len() + old_range.len();
 
-        let mut contains_focus = false;
-        let mut source_stack = vec![];
-        for (source_node_id, source_node) in source
-            .nodes
-            .iter_mut()
-            .enumerate()
-            .skip(old_range.start)
-            .take(old_range.len())
-        {
-            let source_node_id = DispatchNodeId(source_node_id);
-            while let Some(source_ancestor) = source_stack.last() {
-                if source_node.parent == Some(*source_ancestor) {
-                    break;
-                } else {
-                    source_stack.pop();
-                    self.pop_node();
-                }
-            }
-
-            source_stack.push(source_node_id);
-            if source_node.focus_id.is_some() && source_node.focus_id == focus {
-                contains_focus = true;
-            }
-            self.move_node(source_node);
-        }
-
-        while !source_stack.is_empty() {
-            source_stack.pop();
-            self.pop_node();
-        }
+        let contains_focus = reuse::copy_nodes(self, source, old_range.clone(), focus);
 
         ReusedSubtree {
             old_range,
