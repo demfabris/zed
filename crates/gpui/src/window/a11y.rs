@@ -128,6 +128,11 @@ pub(crate) struct A11y {
     ///
     /// [forcibly disabled]: crate::Application::new_inaccessible
     force_disabled: bool,
+    /// Whether the tree is built every frame even with no assistive
+    /// technology connected. Set through [`crate::Application::with_accessibility_forced`]
+    /// or [`crate::Window::set_a11y_forced`]; for automation and tree inspection.
+    /// [`Self::force_disabled`] still wins.
+    forced: bool,
     /// Whether a11y features have been requested by the system.
     ///
     /// Updated by AccessKit using callbacks provided to the adapter. Can change
@@ -167,10 +172,12 @@ impl A11y {
     pub(crate) fn new(
         active_flag: Arc<AtomicBool>,
         force_disabled: bool,
+        forced: bool,
         window_title: Option<SharedString>,
     ) -> Self {
         Self {
             force_disabled,
+            forced,
             active_flag,
             active_this_frame: false,
             nodes: A11yNodeBuilder::new(),
@@ -210,7 +217,14 @@ impl A11y {
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = self.is_enabled() && self.active_flag.load(Ordering::SeqCst);
+        self.active_this_frame =
+            self.is_enabled() && (self.forced || self.active_flag.load(Ordering::SeqCst));
+    }
+
+    /// Build the tree every frame regardless of whether assistive technology
+    /// is connected. Takes effect on the next frame.
+    pub(crate) fn set_forced(&mut self, forced: bool) {
+        self.forced = forced;
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -653,7 +667,7 @@ mod tests {
     }
 
     fn new_a11y() -> A11y {
-        let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, None);
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(true)), false, false, None);
         a11y.begin_frame();
         a11y
     }
@@ -662,13 +676,40 @@ mod tests {
     fn accessibility_enabled_is_independent_of_activation() {
         for force_disabled in [false, true] {
             for active in [false, true] {
-                let mut a11y = A11y::new(Arc::new(AtomicBool::new(active)), force_disabled, None);
-                a11y.sync_active_flag();
+                for forced in [false, true] {
+                    let mut a11y = A11y::new(
+                        Arc::new(AtomicBool::new(active)),
+                        force_disabled,
+                        forced,
+                        None,
+                    );
+                    a11y.sync_active_flag();
 
-                assert_eq!(a11y.is_enabled(), !force_disabled);
-                assert_eq!(a11y.is_active(), !force_disabled && active);
+                    assert_eq!(a11y.is_enabled(), !force_disabled);
+                    assert_eq!(a11y.is_active(), !force_disabled && (active || forced));
+                }
             }
         }
+    }
+
+    #[test]
+    fn disabling_forced_tree_preserves_adapter_activation() {
+        let active_flag = Arc::new(AtomicBool::new(true));
+        let mut a11y = A11y::new(active_flag.clone(), false, true, None);
+        a11y.sync_active_flag();
+        assert!(a11y.is_active());
+
+        a11y.set_forced(false);
+        a11y.sync_active_flag();
+        assert!(a11y.is_active());
+
+        active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        a11y.sync_active_flag();
+        assert!(!a11y.is_active());
+
+        a11y.set_forced(true);
+        a11y.sync_active_flag();
+        assert!(a11y.is_active());
     }
 
     #[test]
