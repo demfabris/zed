@@ -407,6 +407,7 @@ impl WgpuResources {
 
 struct WgpuRendererCore {
     resources: WgpuResources,
+    uploaded_globals: Option<(GlobalParams, GlobalParams, GammaParams)>,
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
@@ -1517,6 +1518,7 @@ impl WgpuRendererCore {
                 path_msaa_view: None,
                 shader_layers,
             },
+            uploaded_globals: None,
             atlas,
             path_globals_offset,
             gamma_offset,
@@ -1630,21 +1632,35 @@ impl WgpuRendererCore {
             premultiplied_alpha: 0,
             ..globals
         };
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            0,
-            bytemuck::bytes_of(&globals),
-        );
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            self.path_globals_offset,
-            bytemuck::bytes_of(&path_globals),
-        );
-        self.resources.queue.write_buffer(
-            &self.resources.globals_buffer,
-            self.gamma_offset,
-            bytemuck::bytes_of(&gamma_params),
-        );
+        let uploaded_globals = self.uploaded_globals.as_ref();
+        if uploaded_globals.is_none_or(|(previous, _, _)| {
+            bytemuck::bytes_of(previous) != bytemuck::bytes_of(&globals)
+        }) {
+            self.resources.queue.write_buffer(
+                &self.resources.globals_buffer,
+                0,
+                bytemuck::bytes_of(&globals),
+            );
+        }
+        if uploaded_globals.is_none_or(|(_, previous, _)| {
+            bytemuck::bytes_of(previous) != bytemuck::bytes_of(&path_globals)
+        }) {
+            self.resources.queue.write_buffer(
+                &self.resources.globals_buffer,
+                self.path_globals_offset,
+                bytemuck::bytes_of(&path_globals),
+            );
+        }
+        if uploaded_globals.is_none_or(|(_, _, previous)| {
+            bytemuck::bytes_of(previous) != bytemuck::bytes_of(&gamma_params)
+        }) {
+            self.resources.queue.write_buffer(
+                &self.resources.globals_buffer,
+                self.gamma_offset,
+                bytemuck::bytes_of(&gamma_params),
+            );
+        }
+        self.uploaded_globals = Some((globals, path_globals, gamma_params));
 
         self.record_frame(scene, target_view, size, clear_color)
             .inspect_err(|_| {
