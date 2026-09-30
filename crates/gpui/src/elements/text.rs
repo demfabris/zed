@@ -678,7 +678,7 @@ impl TextLayout {
 
                 // Only use cached layout if:
                 // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
+                // 2. the wrap width is one the cached layout already answers
                 // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
                 // 4. the cached layout was not truncated (a truncated layout answers an
@@ -686,7 +686,9 @@ impl TextLayout {
                 //    sizing with whatever width some earlier measure pass happened to use)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && wrap_width == text_layout.wrap_width
+                    && (wrap_width == text_layout.wrap_width
+                        || (text_layout.wrap_width.is_none()
+                            && wrap_width.is_some_and(|wrap_width| size.width <= wrap_width)))
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {
