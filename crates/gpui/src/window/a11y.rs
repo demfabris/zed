@@ -302,6 +302,7 @@ impl A11y {
             self.nodes.active_descendant,
             self.window_title.as_ref(),
             frame,
+            &self.node_bounds,
         );
         #[cfg(debug_assertions)]
         self.debug.capture_node_info(&self.nodes.node_info);
@@ -310,6 +311,18 @@ impl A11y {
 
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
+    }
+
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.debug.last_tree_update()
+    }
+
+    pub(crate) fn last_node_bounds(&self, id: NodeId) -> Option<Bounds<Pixels>> {
+        self.debug.node_bounds(id)
+    }
+
+    pub(crate) fn frame_number(&self) -> u64 {
+        self.debug.frame_number()
     }
 }
 
@@ -652,7 +665,7 @@ mod tests {
     // Import specific items rather than glob-importing `super`, which would pull
     // in gpui's own `test` attribute macro and shadow the standard one.
     use super::{A11y, A11yNodeBuilder, ROOT_NODE_ID};
-    use crate::FocusId;
+    use crate::{Bounds, FocusId, point, px, size};
     use accesskit::{NodeId, Role};
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -710,6 +723,45 @@ mod tests {
         a11y.set_forced(true);
         a11y.sync_active_flag();
         assert!(a11y.is_active());
+    }
+
+    #[test]
+    fn retained_tree_and_bounds_survive_begin_frame_and_replace_on_capture() {
+        let mut a11y = new_a11y();
+        let first = NodeId(1);
+        let first_bounds = Bounds::new(point(px(12.), px(34.)), size(px(56.), px(78.)));
+        assert!(a11y.last_tree_update().is_none());
+        assert_eq!(a11y.frame_number(), 0);
+        assert!(a11y.nodes.push(first, test_node()));
+        a11y.node_bounds.insert(first, first_bounds);
+        a11y.nodes.pop();
+        a11y.end_frame(Default::default());
+
+        a11y.begin_frame();
+        assert!(a11y.node_bounds.is_empty());
+        assert_eq!(a11y.last_node_bounds(first), Some(first_bounds));
+        assert!(
+            a11y.last_tree_update()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|(id, _)| *id == first)
+        );
+        assert_eq!(a11y.frame_number(), 1);
+
+        let second = NodeId(2);
+        let second_bounds = Bounds::new(point(px(98.), px(76.)), size(px(54.), px(32.)));
+        assert!(a11y.nodes.push(second, test_node()));
+        a11y.node_bounds.insert(second, second_bounds);
+        a11y.nodes.pop();
+        a11y.end_frame(Default::default());
+
+        assert_eq!(a11y.last_node_bounds(first), None);
+        assert_eq!(a11y.last_node_bounds(second), Some(second_bounds));
+        let update = a11y.last_tree_update().unwrap();
+        assert!(!update.nodes.iter().any(|(id, _)| *id == first));
+        assert!(update.nodes.iter().any(|(id, _)| *id == second));
+        assert_eq!(a11y.frame_number(), 2);
     }
 
     #[test]
