@@ -60,8 +60,14 @@ impl LinuxDispatcher {
 
                 let handle = event_loop.handle();
                 let timer_handle = event_loop.handle();
+                let signal = event_loop.get_signal();
                 handle
                     .insert_source(timer_channel, move |e, _, _| {
+                        // The dispatcher owning the sender is gone; timers already
+                        // scheduled would run tasks nothing can observe.
+                        if let channel::Event::Closed = e {
+                            signal.stop();
+                        }
                         if let channel::Event::Msg(timer) = e {
                             let mut runnable = Some(timer.runnable);
                             timer_handle
@@ -306,6 +312,26 @@ impl<T> calloop::EventSource for PriorityQueueCalloopReceiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatcher_threads_exit_when_owner_drops() {
+        let (sender, _receiver) = PriorityQueueCalloopReceiver::new();
+        let mut dispatcher = LinuxDispatcher::new(sender);
+        let threads = std::mem::take(&mut dispatcher._background_threads);
+        drop(dispatcher);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while threads.iter().any(|thread| !thread.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(threads.iter().all(thread::JoinHandle::is_finished));
+        for thread in threads {
+            thread
+                .join()
+                .expect("dispatcher thread should exit cleanly");
+        }
+    }
 
     #[test]
     fn calloop_works() {
