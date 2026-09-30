@@ -686,7 +686,7 @@ impl TextLayout {
                 //    sizing with whatever width some earlier measure pass happened to use)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                    && wrap_width == text_layout.wrap_width
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
                 {
@@ -1312,5 +1312,204 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+}
+
+#[cfg(test)]
+mod measurement_regression_tests {
+    use super::TextLayout;
+    use crate::{
+        App, AppContext as _, AvailableSpace, DrawPhase, Empty, Pixels, Size, TestAppContext,
+        TextOverflow, TextStyleRefinement, WhiteSpace, Window, px, size,
+    };
+
+    const TEXT: &str = "alpha beta gamma";
+
+    fn text_style(
+        white_space: WhiteSpace,
+        text_overflow: Option<TextOverflow>,
+        line_clamp: Option<usize>,
+    ) -> TextStyleRefinement {
+        TextStyleRefinement {
+            font_size: Some(px(10.).into()),
+            line_height: Some(px(10.).into()),
+            white_space: Some(white_space),
+            text_overflow,
+            line_clamp,
+            ..Default::default()
+        }
+    }
+
+    fn measure_probe(
+        text_layout: &TextLayout,
+        style: TextStyleRefinement,
+        available_width: AvailableSpace,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Size<Pixels> {
+        let layout_id = window.with_text_style(Some(style), |window| {
+            text_layout.layout(TEXT.into(), None, window, cx)
+        });
+        window.compute_layout(
+            layout_id,
+            size(available_width, AvailableSpace::MaxContent),
+            cx,
+        );
+        let outer_size = window.layout_bounds(layout_id).size;
+        let measured_size = text_layout
+            .0
+            .borrow()
+            .as_ref()
+            .and_then(|layout| layout.size)
+            .expect("measurement should record its size");
+        println!(
+            "text measurement: offered={available_width:?} cached={measured_size:?} outer={outer_size:?}"
+        );
+        measured_size
+    }
+
+    #[gpui::test]
+    fn text_measurement_fit_width_preserves_geometry(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            let layout = TextLayout::default();
+            let intrinsic = measure_probe(
+                &layout,
+                text_style(WhiteSpace::Normal, None, None),
+                AvailableSpace::MaxContent,
+                window,
+                cx,
+            );
+            assert_eq!(intrinsic, size(px(96.), px(10.)));
+            assert_eq!(layout.wrapped_text(), TEXT);
+
+            let wider = measure_probe(
+                &layout,
+                text_style(WhiteSpace::Normal, None, None),
+                AvailableSpace::Definite(px(120.)),
+                window,
+                cx,
+            );
+            assert_eq!(wider, intrinsic);
+            assert_eq!(layout.wrapped_text(), TEXT);
+
+            let narrow = measure_probe(
+                &layout,
+                text_style(WhiteSpace::Normal, None, None),
+                AvailableSpace::Definite(px(36.)),
+                window,
+                cx,
+            );
+            assert_eq!(narrow.width, px(36.));
+            assert!(narrow.height > intrinsic.height);
+            assert!(layout.wrapped_text().contains('\n'));
+
+            let wider_again = measure_probe(
+                &layout,
+                text_style(WhiteSpace::Normal, None, None),
+                AvailableSpace::Definite(px(120.)),
+                window,
+                cx,
+            );
+            assert_eq!(wider_again, intrinsic);
+            assert_eq!(layout.wrapped_text(), TEXT);
+            window.invalidator.set_phase(DrawPhase::None);
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn text_measurement_truncation_preserves_intrinsic_geometry(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            for (white_space, overflow, line_clamp) in [
+                (WhiteSpace::Nowrap, TextOverflow::Truncate("…".into()), None),
+                (
+                    WhiteSpace::Nowrap,
+                    TextOverflow::TruncateStart("…".into()),
+                    None,
+                ),
+                (
+                    WhiteSpace::Nowrap,
+                    TextOverflow::TruncateMiddle("…".into()),
+                    None,
+                ),
+                (
+                    WhiteSpace::Normal,
+                    TextOverflow::Truncate("…".into()),
+                    Some(1),
+                ),
+            ] {
+                let layout = TextLayout::default();
+                let style = || text_style(white_space, Some(overflow.clone()), line_clamp);
+                let intrinsic =
+                    measure_probe(&layout, style(), AvailableSpace::MaxContent, window, cx);
+                assert_eq!(intrinsic, size(px(96.), px(10.)));
+                assert_eq!(layout.text(), TEXT);
+
+                let narrow = measure_probe(
+                    &layout,
+                    style(),
+                    AvailableSpace::Definite(px(36.)),
+                    window,
+                    cx,
+                );
+                assert!(narrow.width <= px(36.));
+                assert_eq!(narrow.height, px(10.));
+                assert_ne!(layout.text(), TEXT);
+                assert!(layout.text().contains('…'));
+
+                let restored =
+                    measure_probe(&layout, style(), AvailableSpace::MaxContent, window, cx);
+                assert_eq!(restored, intrinsic);
+                assert_eq!(layout.text(), TEXT);
+                assert_eq!(layout.wrapped_text(), TEXT);
+
+                let wider = measure_probe(
+                    &layout,
+                    style(),
+                    AvailableSpace::Definite(px(120.)),
+                    window,
+                    cx,
+                );
+                assert_eq!(wider, intrinsic);
+                assert_eq!(layout.text(), TEXT);
+            }
+            window.invalidator.set_phase(DrawPhase::None);
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn text_measurement_wrapped_probe_restores_intrinsic_geometry(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            let layout = TextLayout::default();
+            let narrow = measure_probe(
+                &layout,
+                text_style(WhiteSpace::Normal, None, None),
+                AvailableSpace::Definite(px(36.)),
+                window,
+                cx,
+            );
+            assert_eq!(narrow.width, px(36.));
+            assert!(narrow.height > px(10.));
+            assert!(layout.wrapped_text().contains('\n'));
+
+            let intrinsic = measure_probe(
+                &layout,
+                text_style(WhiteSpace::Normal, None, None),
+                AvailableSpace::MaxContent,
+                window,
+                cx,
+            );
+            assert_eq!(intrinsic, size(px(96.), px(10.)));
+            assert_eq!(layout.wrapped_text(), TEXT);
+            window.invalidator.set_phase(DrawPhase::None);
+        })
+        .unwrap();
     }
 }
