@@ -38,6 +38,7 @@ use crate::{
     FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
     util::FluentBuilder, window::with_element_arena,
 };
+use collections::FxHashMap;
 use derive_more::Deref;
 use std::{
     any::Any,
@@ -262,6 +263,41 @@ impl Eq for GlobalElementId {}
 impl std::hash::Hash for GlobalElementId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         state.write_u64(self.path_hash());
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct GlobalIdCache {
+    previous: FxHashMap<u64, GlobalElementId>,
+    current: FxHashMap<u64, GlobalElementId>,
+}
+
+impl GlobalIdCache {
+    fn path_hash(path: &[ElementId]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = collections::FxHasher::default();
+        path.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub(crate) fn get(&mut self, path: &[ElementId]) -> GlobalElementId {
+        let hash = Self::path_hash(path);
+        if let Some(id) = self.current.get(&hash)
+            && *id.0 == *path
+        {
+            return id.clone();
+        }
+        let id = match self.previous.get(&hash) {
+            Some(id) if *id.0 == *path => id.clone(),
+            _ => GlobalElementId::new(Arc::from(path)),
+        };
+        self.current.insert(hash, id.clone());
+        id
+    }
+
+    pub(crate) fn finish_frame(&mut self) {
+        mem::swap(&mut self.previous, &mut self.current);
+        self.current.clear();
     }
 }
 
@@ -847,7 +883,7 @@ impl Element for Empty {
 #[inline(never)]
 fn prepare_element_id(element_id: ElementId, window: &mut Window) -> GlobalElementId {
     window.element_id_stack.push(element_id);
-    GlobalElementId::new(Arc::from(&*window.element_id_stack))
+    window.global_ids.get(&window.element_id_stack)
 }
 
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -918,5 +954,61 @@ mod tests {
             accesskit::NodeId(hasher.finish())
         );
         assert_eq!(first.accesskit_node_id(), next_frame.accesskit_node_id());
+    }
+}
+
+#[cfg(test)]
+mod global_id_cache_tests {
+    use super::*;
+
+    fn path(ids: &[&'static str]) -> Vec<ElementId> {
+        ids.iter().map(|id| ElementId::from(*id)).collect()
+    }
+
+    #[test]
+    fn global_ids_are_reused_while_their_path_is_in_use() {
+        let row = path(&["root", "table", "row"]);
+        let mut cache = GlobalIdCache::default();
+
+        let first = cache.get(&row);
+        assert!(Arc::ptr_eq(&first.0, &cache.get(&row).0));
+
+        cache.finish_frame();
+        let next = cache.get(&row);
+        assert!(Arc::ptr_eq(&first.0, &next.0));
+        assert_eq!(first.accesskit_node_id(), next.accesskit_node_id());
+
+        cache.finish_frame();
+        cache.finish_frame();
+        let later = cache.get(&row);
+        assert!(!Arc::ptr_eq(&first.0, &later.0));
+        assert_eq!(first, later);
+    }
+
+    #[test]
+    fn unused_global_ids_are_released_after_one_unused_frame() {
+        let row = path(&["root", "table", "row"]);
+        let mut cache = GlobalIdCache::default();
+        let id = cache.get(&row);
+        let weak = Arc::downgrade(&id.0);
+        drop(id);
+        cache.finish_frame();
+        assert!(weak.upgrade().is_some());
+        cache.finish_frame();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn global_id_cache_checks_paths_on_hash_collisions() {
+        let row = path(&["root", "table", "row"]);
+        let cell = path(&["root", "table", "cell"]);
+        let hash = GlobalIdCache::path_hash(&row);
+        let mut cache = GlobalIdCache::default();
+        let collision = GlobalElementId::new(Arc::from(&*cell));
+        cache.current.insert(hash, collision.clone());
+        assert_eq!(&*cache.get(&row).0, &*row);
+        cache.current.clear();
+        cache.previous.insert(hash, collision);
+        assert_eq!(&*cache.get(&row).0, &*row);
     }
 }
