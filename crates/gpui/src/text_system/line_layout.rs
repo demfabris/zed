@@ -455,6 +455,17 @@ impl WrappedLineLayout {
     }
 }
 
+fn carry_over<K: Eq + Hash, V>(
+    previous: &mut FxHashMap<Arc<K>, Arc<V>>,
+    current: &mut FxHashMap<Arc<K>, Arc<V>>,
+) {
+    previous.retain(|_, layout| Arc::strong_count(layout) > 1);
+    if previous.len() < current.len() {
+        std::mem::swap(previous, current);
+    }
+    previous.extend(current.drain());
+}
+
 pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
@@ -585,18 +596,35 @@ impl LineLayoutCache {
 
     pub fn finish_frame(&self) {
         let _font_generation = self.clear_if_font_generation_changed();
-        let mut curr_frame = self.current_frame.write();
-        let mut prev_frame = self.previous_frame.lock();
-        std::mem::swap(&mut *prev_frame, &mut *curr_frame);
-        curr_frame.lines.clear();
-        curr_frame.wrapped_lines.clear();
-        curr_frame.used_lines.clear();
-        curr_frame.used_wrapped_lines.clear();
+        let mut current = self.current_frame.write();
+        let mut previous = self.previous_frame.lock();
+        let (previous, current) = (&mut *previous, &mut *current);
 
-        curr_frame.lines_by_hash.clear();
-        curr_frame.wrapped_lines_by_hash.clear();
-        curr_frame.used_lines_by_hash.clear();
-        curr_frame.used_wrapped_lines_by_hash.clear();
+        carry_over(&mut previous.wrapped_lines, &mut current.wrapped_lines);
+        carry_over(
+            &mut previous.wrapped_lines_by_hash,
+            &mut current.wrapped_lines_by_hash,
+        );
+        carry_over(&mut previous.lines, &mut current.lines);
+        carry_over(&mut previous.lines_by_hash, &mut current.lines_by_hash);
+
+        std::mem::swap(&mut previous.used_lines, &mut current.used_lines);
+        std::mem::swap(
+            &mut previous.used_wrapped_lines,
+            &mut current.used_wrapped_lines,
+        );
+        std::mem::swap(
+            &mut previous.used_lines_by_hash,
+            &mut current.used_lines_by_hash,
+        );
+        std::mem::swap(
+            &mut previous.used_wrapped_lines_by_hash,
+            &mut current.used_wrapped_lines_by_hash,
+        );
+        current.used_lines.clear();
+        current.used_wrapped_lines.clear();
+        current.used_lines_by_hash.clear();
+        current.used_wrapped_lines_by_hash.clear();
     }
 
     pub fn layout_wrapped_line<Text>(
@@ -828,8 +856,8 @@ impl LineLayoutCache {
         // (We avoid `drain()` here because it would eagerly move all entries.)
         let mut previous_frame = self.previous_frame.lock();
         if let Some(existing_key) = previous_frame
-            .used_lines_by_hash
-            .iter()
+            .lines_by_hash
+            .keys()
             .find(|key| {
                 HashedCacheKeyRef {
                     text_hash: key.text_hash,
@@ -1109,6 +1137,98 @@ mod tests {
             let line = cache.layout_wrapped_line(text, px(16.0), &runs, Some(px(30.0)), Some(1));
             assert!(line.wrap_boundaries.is_empty());
         }
+    }
+
+    fn held_line_cache() -> (LineLayoutCache, Arc<AtomicUsize>, [FontRun; 1]) {
+        let generation = Arc::new(AtomicUsize::new(0));
+        let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem), generation.clone());
+        let runs = [FontRun {
+            len: 9,
+            font_id: FontId(1),
+        }];
+        (cache, generation, runs)
+    }
+
+    #[test]
+    fn held_lines_survive_idle_frames_and_are_removed_after_release() {
+        let (cache, _, runs) = held_line_cache();
+        let line = cache.layout_line("held line", px(16.0), &runs, None);
+        for _ in 0..5 {
+            cache.finish_frame();
+        }
+        let reused = cache.layout_line("held line", px(16.0), &runs, None);
+        assert!(Arc::ptr_eq(&line, &reused));
+        assert_eq!(cache.current_frame.read().used_lines.len(), 1);
+        drop((line, reused));
+        cache.finish_frame();
+        cache.finish_frame();
+        assert!(cache.previous_frame.lock().lines.is_empty());
+        assert!(cache.current_frame.read().lines.is_empty());
+    }
+
+    #[test]
+    fn held_hash_lines_survive_idle_frames_without_materialization() {
+        let (cache, _, runs) = held_line_cache();
+        let line =
+            cache.layout_line_by_hash(17, 9, px(16.0), &runs, Some(px(8.0)), || "held line".into());
+        for _ in 0..5 {
+            cache.finish_frame();
+        }
+        assert!(cache.previous_frame.lock().used_lines_by_hash.is_empty());
+        let probed = cache
+            .try_layout_line_by_hash(17, 9, px(16.0), &runs, Some(px(8.0)))
+            .unwrap();
+        assert!(Arc::ptr_eq(&line, &probed));
+        let reused = cache.layout_line_by_hash(17, 9, px(16.0), &runs, Some(px(8.0)), || {
+            panic!("held hash line should not be materialized")
+        });
+        assert!(Arc::ptr_eq(&line, &reused));
+        assert_eq!(cache.current_frame.read().used_lines_by_hash.len(), 1);
+        assert!(
+            cache
+                .try_layout_line_by_hash(17, 9, px(16.0), &runs, None)
+                .is_none()
+        );
+        drop((line, probed, reused));
+        cache.finish_frame();
+        cache.finish_frame();
+        assert!(cache.previous_frame.lock().lines_by_hash.is_empty());
+    }
+
+    #[test]
+    fn releasing_wrapped_lines_releases_their_unwrapped_cache_entries() {
+        let (cache, _, runs) = held_line_cache();
+        let wrapped = cache.layout_wrapped_line("held line", px(16.0), &runs, Some(px(20.0)), None);
+        for _ in 0..5 {
+            cache.finish_frame();
+        }
+        let reused = cache.layout_wrapped_line("held line", px(16.0), &runs, Some(px(20.0)), None);
+        assert!(Arc::ptr_eq(&wrapped, &reused));
+        cache.finish_frame();
+        drop((wrapped, reused));
+        cache.finish_frame();
+        let previous = cache.previous_frame.lock();
+        assert!(previous.wrapped_lines.is_empty());
+        assert!(previous.lines.is_empty());
+    }
+
+    #[test]
+    fn font_generation_invalidates_externally_held_layouts() {
+        let (cache, generation, runs) = held_line_cache();
+        let line = cache.layout_line("held line", px(16.0), &runs, None);
+        let hashed = cache.layout_line_by_hash(17, 9, px(16.0), &runs, None, || "held line".into());
+        let wrapped = cache.layout_wrapped_line("held line", px(16.0), &runs, Some(px(20.0)), None);
+        cache.finish_frame();
+        generation.fetch_add(1, Ordering::Release);
+        cache.finish_frame();
+        let fresh = cache.layout_line("held line", px(16.0), &runs, None);
+        let fresh_hash =
+            cache.layout_line_by_hash(17, 9, px(16.0), &runs, None, || "held line".into());
+        let fresh_wrap =
+            cache.layout_wrapped_line("held line", px(16.0), &runs, Some(px(20.0)), None);
+        assert!(!Arc::ptr_eq(&line, &fresh));
+        assert!(!Arc::ptr_eq(&hashed, &fresh_hash));
+        assert!(!Arc::ptr_eq(&wrapped, &fresh_wrap));
     }
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
