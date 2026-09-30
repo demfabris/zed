@@ -3,6 +3,7 @@ mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
+mod recent_shapes;
 
 pub use font_fallbacks::*;
 pub use font_features::*;

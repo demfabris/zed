@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-use super::LineWrapper;
+use super::{LineWrapper, recent_shapes::RecentShapes};
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -474,6 +474,7 @@ pub(crate) struct LineLayoutCache {
     font_generation: Arc<AtomicUsize>,
     /// Records the generation represented by both frame caches.
     cached_font_generation: AtomicUsize,
+    recent_shapes: Mutex<RecentShapes>,
 }
 
 #[derive(Default)]
@@ -516,6 +517,7 @@ impl LineLayoutCache {
             platform_text_system,
             font_generation,
             cached_font_generation: AtomicUsize::new(cached_font_generation),
+            recent_shapes: Mutex::default(),
         }
     }
 
@@ -706,7 +708,7 @@ impl LineLayoutCache {
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
-        let _font_generation = self.clear_if_font_generation_changed();
+        let font_generation = self.clear_if_font_generation_changed();
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
@@ -728,9 +730,7 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
+            let mut layout = self.shape_line(&text, font_size, runs, font_generation);
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -825,7 +825,7 @@ impl LineLayoutCache {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
-        let _font_generation = self.clear_if_font_generation_changed();
+        let font_generation = self.clear_if_font_generation_changed();
         let key_ref = HashedCacheKeyRef {
             text_hash,
             text_len,
@@ -880,9 +880,7 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
-        let mut layout = self
-            .platform_text_system
-            .layout_line(&text, font_size, runs);
+        let mut layout = self.shape_line(&text, font_size, runs, font_generation);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -904,6 +902,30 @@ impl LineLayoutCache {
         layout
     }
 
+    fn shape_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        font_generation: usize,
+    ) -> LineLayout {
+        let hash = RecentShapes::hash(text, font_size, runs);
+        if let Some(layout) =
+            self.recent_shapes
+                .lock()
+                .get(font_generation, hash, text, font_size, runs)
+        {
+            return layout;
+        }
+        let layout = self.platform_text_system.layout_line(text, font_size, runs);
+        if self.font_generation.load(Ordering::Acquire) == font_generation {
+            self.recent_shapes
+                .lock()
+                .insert(font_generation, hash, text, font_size, runs, &layout);
+        }
+        layout
+    }
+
     fn clear_if_font_generation_changed(&self) -> usize {
         let font_generation = self.font_generation.load(Ordering::Acquire);
         if self.cached_font_generation.load(Ordering::Acquire) == font_generation {
@@ -917,6 +939,7 @@ impl LineLayoutCache {
 
         *current_frame = FrameCache::default();
         *self.previous_frame.lock() = FrameCache::default();
+        *self.recent_shapes.lock() = RecentShapes::default();
         self.cached_font_generation
             .store(font_generation, Ordering::Release);
         font_generation
@@ -1229,6 +1252,239 @@ mod tests {
         assert!(!Arc::ptr_eq(&line, &fresh));
         assert!(!Arc::ptr_eq(&hashed, &fresh_hash));
         assert!(!Arc::ptr_eq(&wrapped, &fresh_wrap));
+    }
+
+    struct RecentShapesTestPlatform {
+        owner: u32,
+        shaped: AtomicUsize,
+        installed: AtomicUsize,
+        native_generation: std::sync::atomic::AtomicU64,
+        change_during_shape: Mutex<Option<Arc<AtomicUsize>>>,
+    }
+
+    impl RecentShapesTestPlatform {
+        fn new(owner: u32) -> Self {
+            Self {
+                owner,
+                shaped: AtomicUsize::new(0),
+                installed: AtomicUsize::new(0),
+                native_generation: std::sync::atomic::AtomicU64::new(0),
+                change_during_shape: Mutex::default(),
+            }
+        }
+    }
+
+    impl PlatformTextSystem for RecentShapesTestPlatform {
+        fn add_fonts(&self, _: Vec<std::borrow::Cow<'static, [u8]>>) -> crate::Result<()> {
+            self.installed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn all_font_names(&self) -> Vec<String> {
+            crate::NoopTextSystem.all_font_names()
+        }
+
+        fn font_id(&self, descriptor: &crate::Font) -> crate::Result<FontId> {
+            crate::NoopTextSystem.font_id(descriptor)
+        }
+
+        fn font_generation(&self) -> u64 {
+            self.native_generation.load(Ordering::Relaxed)
+        }
+
+        fn font_metrics(&self, font_id: FontId) -> crate::FontMetrics {
+            crate::NoopTextSystem.font_metrics(font_id)
+        }
+
+        fn typographic_bounds(
+            &self,
+            font_id: FontId,
+            glyph_id: GlyphId,
+        ) -> crate::Result<crate::Bounds<f32>> {
+            crate::NoopTextSystem.typographic_bounds(font_id, glyph_id)
+        }
+
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> crate::Result<Size<f32>> {
+            crate::NoopTextSystem.advance(font_id, glyph_id)
+        }
+
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            crate::NoopTextSystem.glyph_for_char(font_id, ch)
+        }
+
+        fn glyph_raster_bounds(
+            &self,
+            params: &crate::RenderGlyphParams,
+        ) -> crate::Result<crate::Bounds<crate::DevicePixels>> {
+            crate::NoopTextSystem.glyph_raster_bounds(params)
+        }
+
+        fn rasterize_glyph(
+            &self,
+            params: &crate::RenderGlyphParams,
+            bounds: crate::Bounds<crate::DevicePixels>,
+        ) -> crate::Result<(Size<crate::DevicePixels>, Vec<u8>)> {
+            crate::NoopTextSystem.rasterize_glyph(params, bounds)
+        }
+
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            self.shaped.fetch_add(1, Ordering::Relaxed);
+            let mut layout = crate::NoopTextSystem.layout_line(text, font_size, runs);
+            let glyph_offset = self.owner
+                + self.installed.load(Ordering::Relaxed) as u32
+                + self.native_generation.load(Ordering::Relaxed) as u32;
+            for glyph in layout.runs.iter_mut().flat_map(|run| &mut run.glyphs) {
+                glyph.id.0 += glyph_offset;
+            }
+            if let Some(generation) = self.change_during_shape.lock().take() {
+                generation.fetch_add(1, Ordering::Release);
+            }
+            layout
+        }
+
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> crate::TextRenderingMode {
+            crate::NoopTextSystem.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    fn recent_shapes_window_system(
+        owner: u32,
+    ) -> (
+        crate::WindowTextSystem,
+        Arc<RecentShapesTestPlatform>,
+        [crate::TextRun; 1],
+    ) {
+        let platform = Arc::new(RecentShapesTestPlatform::new(owner));
+        let text_system = Arc::new(crate::TextSystem::new(platform.clone()));
+        let runs = [crate::TextRun {
+            len: 3,
+            font: crate::font("Test Font"),
+            ..crate::TextRun::default()
+        }];
+        (crate::WindowTextSystem::new(text_system), platform, runs)
+    }
+
+    #[test]
+    fn recent_shapes_reuse_raw_geometry_after_frame_eviction_and_before_force_width() {
+        let (system, platform, runs) = recent_shapes_window_system(100);
+        let native = system.layout_line("abc", px(16.0), &runs, None);
+        let forced = system.layout_line("abc", px(16.0), &runs, Some(px(8.0)));
+        assert_eq!(platform.shaped.load(Ordering::Relaxed), 1);
+        assert_eq!(forced.runs[0].glyphs[1].position.x, px(8.0));
+        assert!(native.runs[0].glyphs[1].position.x > px(9.0));
+        let native_position = native.runs[0].glyphs[1].position;
+        let native_width = native.width;
+        let original = Arc::downgrade(&native);
+        drop((native, forced));
+        for _ in 0..3 {
+            system.finish_frame();
+        }
+        assert!(original.upgrade().is_none());
+        let fresh = system.layout_line("abc", px(16.0), &runs, None);
+        assert_eq!(platform.shaped.load(Ordering::Relaxed), 1);
+        assert!(!original.ptr_eq(&Arc::downgrade(&fresh)));
+        assert_eq!(fresh.runs[0].glyphs[1].position, native_position);
+        assert_eq!(fresh.width, native_width);
+    }
+
+    #[test]
+    fn recent_shapes_keep_hash_probe_and_materialization_contracts() {
+        let (system, platform, runs) = recent_shapes_window_system(100);
+        system.layout_line("abc", px(16.0), &runs, None);
+        let materialized = AtomicUsize::new(0);
+        let first = system.layout_line_by_hash(17, 3, px(16.0), &runs, None, || {
+            materialized.fetch_add(1, Ordering::Relaxed);
+            "abc".into()
+        });
+        assert_eq!(materialized.load(Ordering::Relaxed), 1);
+        assert_eq!(platform.shaped.load(Ordering::Relaxed), 1);
+        let current = system.layout_line_by_hash(17, 3, px(16.0), &runs, None, || {
+            panic!("current hit must not materialize")
+        });
+        assert!(Arc::ptr_eq(&first, &current));
+        system.finish_frame();
+        let previous = system.layout_line_by_hash(17, 3, px(16.0), &runs, None, || {
+            panic!("previous hit must not materialize")
+        });
+        assert!(Arc::ptr_eq(&first, &previous));
+        let original_id = first.runs[0].glyphs[0].id;
+        let original = Arc::downgrade(&first);
+        drop((first, current, previous));
+        for _ in 0..3 {
+            system.finish_frame();
+        }
+        assert!(original.upgrade().is_none());
+        assert!(
+            system
+                .try_layout_line_by_hash(17, 3, px(16.0), &runs, None)
+                .is_none()
+        );
+        let fresh = system.layout_line_by_hash(17, 3, px(16.0), &runs, None, || {
+            materialized.fetch_add(1, Ordering::Relaxed);
+            "abc".into()
+        });
+        assert_eq!(materialized.load(Ordering::Relaxed), 2);
+        assert_eq!(platform.shaped.load(Ordering::Relaxed), 1);
+        assert_eq!(fresh.runs[0].glyphs[0].id, original_id);
+        assert!(!original.ptr_eq(&Arc::downgrade(&fresh)));
+    }
+
+    #[test]
+    fn recent_shapes_isolate_owners_and_invalidate_on_installed_and_native_fonts() {
+        let (first, first_platform, runs) = recent_shapes_window_system(100);
+        let (second, second_platform, _) = recent_shapes_window_system(200);
+        let original_first = first.layout_line("abc", px(16.0), &runs, None);
+        let original_second = second.layout_line("abc", px(16.0), &runs, None);
+        let original_first_id = original_first.runs[0].glyphs[0].id;
+        let original_second_id = original_second.runs[0].glyphs[0].id;
+        let second_before = Arc::downgrade(&original_second);
+        assert_ne!(original_first_id, original_second_id);
+        drop((original_first, original_second));
+        for _ in 0..3 {
+            first.finish_frame();
+            second.finish_frame();
+        }
+        assert!(second_before.upgrade().is_none());
+        first.add_fonts(Vec::new()).unwrap();
+        let installed = first.layout_line("abc", px(16.0), &runs, None);
+        let second_hit = second.layout_line("abc", px(16.0), &runs, None);
+        assert_ne!(installed.runs[0].glyphs[0].id, original_first_id);
+        assert_eq!(second_hit.runs[0].glyphs[0].id, original_second_id);
+        assert_eq!(first_platform.shaped.load(Ordering::Relaxed), 2);
+        assert_eq!(second_platform.shaped.load(Ordering::Relaxed), 1);
+        first_platform
+            .native_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let native = first.layout_line("abc", px(16.0), &runs, None);
+        assert_ne!(native.runs[0].glyphs[0].id, installed.runs[0].glyphs[0].id);
+        assert_eq!(first_platform.shaped.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn recent_shapes_do_not_insert_inflight_old_font_generation_results() {
+        let platform = Arc::new(RecentShapesTestPlatform::new(100));
+        let generation = Arc::new(AtomicUsize::new(0));
+        *platform.change_during_shape.lock() = Some(generation.clone());
+        let cache = LineLayoutCache::new(platform.clone(), generation);
+        let runs = [FontRun {
+            len: 3,
+            font_id: FontId(1),
+        }];
+        cache.layout_line("abc", px(16.0), &runs, None);
+        let hash = RecentShapes::hash("abc", px(16.0), &runs);
+        assert!(
+            cache
+                .recent_shapes
+                .lock()
+                .get(0, hash, "abc", px(16.0), &runs)
+                .is_none()
+        );
+        cache.layout_line("abc", px(16.0), &runs, None);
+        assert_eq!(platform.shaped.load(Ordering::Relaxed), 2);
     }
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
