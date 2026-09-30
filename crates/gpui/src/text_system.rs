@@ -396,6 +396,11 @@ impl TextSystem {
         }
     }
 
+    pub(crate) fn font_cache_generation(&self) -> usize {
+        self.sync_font_generation();
+        self.font_generation.load(Ordering::Acquire)
+    }
+
     // Walking the fallback stack costs one failed lookup, and one formatted
     // error, per missing family, so each font is only walked once.
     fn resolve_font_uncached(&self, font: &Font) -> FontId {

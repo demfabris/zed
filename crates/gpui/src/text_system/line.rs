@@ -282,7 +282,7 @@ impl ShapedLine {
                         synthetic_bold: false,
                         synthetic_italic: false,
                     };
-                    let raster_bounds = text_system.raster_bounds(&params)?;
+                    let raster_bounds = window.glyph_raster_bounds(&params)?;
                     if raster_bounds.is_zero() {
                         continue;
                     }
@@ -330,7 +330,7 @@ impl ShapedLine {
                         synthetic_bold: options.synthetic_bold,
                         synthetic_italic: options.synthetic_italic,
                     };
-                    let raster_bounds = text_system.raster_bounds(&params)?;
+                    let raster_bounds = window.glyph_raster_bounds(&params)?;
                     if raster_bounds.is_zero() {
                         continue;
                     }

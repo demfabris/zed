@@ -70,6 +70,7 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod glyph_cache;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -1237,6 +1238,7 @@ pub struct Window {
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
+    glyph_lookup_cache: RefCell<glyph_cache::GlyphLookupCache>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     rem_size: Pixels,
@@ -2108,6 +2110,7 @@ impl Window {
             is_resizable,
             is_minimizable,
             sprite_atlas,
+            glyph_lookup_cache: RefCell::new(glyph_cache::GlyphLookupCache::default()),
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
             rem_size: px(16.),
@@ -3547,6 +3550,7 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.global_ids.finish_frame();
+        self.glyph_lookup_cache.get_mut().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -4998,15 +5002,9 @@ impl Window {
             synthetic_italic: options.synthetic_italic,
         };
 
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        let raster_bounds = self.glyph_raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
+            let tile = self.get_or_insert_glyph_tile(&params)?;
             let bounds = Bounds {
                 origin: integer_origin + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
@@ -5038,13 +5036,52 @@ impl Window {
         Ok(())
     }
 
+    pub(crate) fn glyph_raster_bounds(
+        &self,
+        params: &RenderGlyphParams,
+    ) -> Result<Bounds<DevicePixels>> {
+        let generation = self.text_system().font_cache_generation();
+        {
+            let mut cache = self.glyph_lookup_cache.borrow_mut();
+            cache.sync_font_generation(generation);
+            if let Some((bounds, _)) = cache.lookup(params) {
+                return Ok(bounds);
+            }
+        }
+        let bounds = self.text_system().raster_bounds(params)?;
+        self.glyph_lookup_cache
+            .borrow_mut()
+            .insert_bounds(params, bounds);
+        Ok(bounds)
+    }
+
     pub(crate) fn get_or_insert_glyph_tile(&self, params: &RenderGlyphParams) -> Result<AtlasTile> {
-        self.sprite_atlas
+        let generation = self.text_system().font_cache_generation();
+        let cached = {
+            let mut cache = self.glyph_lookup_cache.borrow_mut();
+            cache.sync_font_generation(generation);
+            cache.lookup(params)
+        };
+        if let Some((_, Some(tile))) = cached {
+            return Ok(tile);
+        }
+        if cached.is_none() {
+            let bounds = self.text_system().raster_bounds(params)?;
+            self.glyph_lookup_cache
+                .borrow_mut()
+                .insert_bounds(params, bounds);
+        }
+        let tile = self
+            .sprite_atlas
             .get_or_insert_with(params.clone().into(), &mut || {
                 let (size, bytes) = self.text_system().rasterize_glyph(params)?;
                 Ok(Some((size, Cow::Owned(bytes))))
             })
-            .and_then(|tile| tile.ok_or_else(|| anyhow!("glyph rasterization returned no tile")))
+            .and_then(|tile| tile.ok_or_else(|| anyhow!("glyph rasterization returned no tile")))?;
+        self.glyph_lookup_cache
+            .borrow_mut()
+            .insert_tile(params, tile);
+        Ok(tile)
     }
 
     pub(crate) fn paint_cached_monochrome_glyph(
