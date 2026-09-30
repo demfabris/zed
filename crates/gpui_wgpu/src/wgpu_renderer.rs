@@ -22,6 +22,8 @@ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
 
+const INSTANCE_BIND_GROUP_KEEP_FRAMES: u64 = 2;
+
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
 const STORAGE_BUFFER_SHADERS: &str = concat!(
@@ -422,6 +424,8 @@ struct WgpuRendererCore {
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
     clip_window_shadows: bool,
+    instance_bind_groups: FxHashMap<(wgpu::Buffer, u64, u64), (wgpu::BindGroup, u64)>,
+    instance_bind_group_frame: u64,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1533,6 +1537,8 @@ impl WgpuRendererCore {
             target_format,
             max_texture_size,
             clip_window_shadows: false,
+            instance_bind_groups: FxHashMap::default(),
+            instance_bind_group_frame: 0,
         }
     }
 
@@ -1600,6 +1606,10 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
+        self.instance_bind_group_frame += 1;
+        let frame = self.instance_bind_group_frame;
+        self.instance_bind_groups
+            .retain(|_, (_, used)| *used + INSTANCE_BIND_GROUP_KEEP_FRAMES >= frame);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -2400,7 +2410,7 @@ impl WgpuRendererCore {
             0
         };
 
-        let resources = self.resources();
+        let resources = &self.resources;
         if !data.is_empty() {
             match &resources.instance_data {
                 InstanceData::Storage(buffer) => resources.queue.write_buffer(buffer, offset, data),
@@ -2409,27 +2419,40 @@ impl WgpuRendererCore {
                 }
             }
         }
-        let bind_group = resources
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &resources.bind_group_layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: match &resources.instance_data {
-                        InstanceData::Storage(buffer) => {
-                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        let create_bind_group = |resource| {
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &resources.bind_group_layouts.instances,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource,
+                    }],
+                })
+        };
+        let frame = self.instance_bind_group_frame;
+        let bind_group = match &resources.instance_data {
+            InstanceData::Storage(buffer) => {
+                let key = (buffer.clone(), offset, size);
+                let (bind_group, used) =
+                    self.instance_bind_groups.entry(key).or_insert_with(|| {
+                        (
+                            create_bind_group(wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                 buffer,
                                 offset,
                                 size: NonZeroU64::new(size),
-                            })
-                        }
-                        InstanceData::Texture { view, .. } => {
-                            wgpu::BindingResource::TextureView(view)
-                        }
-                    },
-                }],
-            });
+                            })),
+                            frame,
+                        )
+                    });
+                *used = frame;
+                bind_group.clone()
+            }
+            InstanceData::Texture { view, .. } => {
+                create_bind_group(wgpu::BindingResource::TextureView(view))
+            }
+        };
         Ok(InstanceBinding {
             bind_group,
             first_instance,
