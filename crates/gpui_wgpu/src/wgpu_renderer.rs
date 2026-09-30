@@ -3263,6 +3263,7 @@ impl RenderingParameters {
         let gamma = env::var("ZED_FONTS_GAMMA")
             .ok()
             .and_then(|v| v.parse().ok())
+            .filter(|value: &f32| value.is_finite())
             .unwrap_or(1.8_f32)
             .clamp(1.0, 2.2);
         let gamma_ratios = get_gamma_correction_ratios(gamma);
@@ -3270,12 +3271,14 @@ impl RenderingParameters {
         let grayscale_enhanced_contrast = env::var("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST")
             .ok()
             .and_then(|v| v.parse().ok())
+            .filter(|value: &f32| value.is_finite())
             .unwrap_or(1.0_f32)
             .max(0.0);
 
         let subpixel_enhanced_contrast = env::var("ZED_FONTS_SUBPIXEL_ENHANCED_CONTRAST")
             .ok()
             .and_then(|v| v.parse().ok())
+            .filter(|value: &f32| value.is_finite())
             .unwrap_or(0.5_f32)
             .max(0.0);
 
@@ -3353,6 +3356,86 @@ mod tests {
     const BLUE: [u8; 4] = [0, 0, 255, 255];
     #[cfg(target_os = "linux")]
     const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonfinite_font_environment_uses_defaults_and_draws_glyphs() -> anyhow::Result<()> {
+        const CHILD: &str = "GPUI_NONFINITE_FONT_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for value in ["NaN", "inf", "-inf"] {
+                let output = std::process::Command::new(std::env::current_exe()?)
+                    .args([
+                        "--exact",
+                        "wgpu_renderer::tests::nonfinite_font_environment_uses_defaults_and_draws_glyphs",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("ZED_FONTS_GAMMA", value)
+                    .env("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST", value)
+                    .env("ZED_FONTS_SUBPIXEL_ENHANCED_CONTRAST", value)
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "font environment {value}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                eprintln!(
+                    "font environment {value}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return Ok(());
+        }
+
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let size = device_size(4, 4);
+        eprintln!(
+            "font test adapter: {:?}",
+            renderer.context.adapter.get_info()
+        );
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(
+                gpui::RenderSvgParams {
+                    path: "font_environment_test".into(),
+                    size,
+                }
+                .into(),
+                &mut || Ok(Some((size, std::borrow::Cow::Owned(vec![128; 16])))),
+            )?
+            .context("glyph tile")?;
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: ScaledPixels(4.0),
+                height: ScaledPixels(4.0),
+            },
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            color: gpui::white(),
+            tile,
+            transformation: gpui::TransformationMatrix::unit(),
+        });
+        scene.finish();
+        let image = renderer.render_scene_to_image(&scene, size)?;
+        let pixel = image.get_pixel(2, 2).0;
+        assert!(pixel[0] > 0 && pixel[0] < 255, "glyph pixel: {pixel:?}");
+        assert_eq!(pixel[0], pixel[1]);
+        assert_eq!(pixel[1], pixel[2]);
+        assert_eq!(pixel[3], 255);
+        let parameters = &renderer.core.rendering_params;
+        assert_eq!(parameters.gamma_ratios, get_gamma_correction_ratios(1.8));
+        assert_eq!(parameters.grayscale_enhanced_contrast, 1.0);
+        assert_eq!(parameters.subpixel_enhanced_contrast, 0.5);
+        eprintln!("nonfinite font environment renders glyph pixel {pixel:?}");
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
