@@ -4619,6 +4619,105 @@ mod tests {
         assert_eq!(second_node.numeric_value(), None);
     }
 
+    struct ClippedA11yButtonTestView {
+        clicked: Rc<RefCell<Vec<&'static str>>>,
+        button_top: Pixels,
+    }
+
+    impl Render for ClippedA11yButtonTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let button = |name: &'static str| {
+                let clicked = self.clicked.clone();
+                div()
+                    .id(name)
+                    .role(accesskit::Role::Button)
+                    .h(px(20.))
+                    .w_full()
+                    .flex_none()
+                    .on_click(move |_, _, _| clicked.borrow_mut().push(name))
+            };
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(
+                    div()
+                        .id("scroll")
+                        .flex()
+                        .flex_col()
+                        .h(px(100.))
+                        .flex_none()
+                        .overflow_y_scroll()
+                        .child(div().h(self.button_top).flex_none())
+                        .child(button("clipped")),
+                )
+                .child(button("footer"))
+        }
+    }
+
+    fn click_a11y_button(cx: &mut TestAppContext, window: AnyWindowHandle, top: Pixels) {
+        cx.update_window(window, |_, window, cx| {
+            window.set_a11y_forced(true);
+            window.draw(cx).clear(cx);
+            let target_node = window
+                .a11y
+                .node_bounds
+                .iter()
+                .find(|(_, bounds)| bounds.origin.y == top)
+                .map(|(id, _)| *id)
+                .expect("button node");
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node,
+                    data: None,
+                },
+                cx,
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn a11y_click_on_fully_clipped_node_does_not_click_footer(cx: &mut TestAppContext) {
+        let clicked = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let clicked = clicked.clone();
+            move |_, _| ClippedA11yButtonTestView {
+                clicked,
+                button_top: px(105.),
+            }
+        });
+        let window = AnyWindowHandle::from(window);
+
+        click_a11y_button(cx, window, px(105.));
+        assert!(
+            clicked.borrow().is_empty(),
+            "clicked {:?}",
+            clicked.borrow()
+        );
+
+        click_a11y_button(cx, window, px(100.));
+        assert_eq!(*clicked.borrow(), ["footer"]);
+    }
+
+    #[gpui::test]
+    fn a11y_click_on_partially_clipped_node_uses_visible_bounds(cx: &mut TestAppContext) {
+        let clicked = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let clicked = clicked.clone();
+            move |_, _| ClippedA11yButtonTestView {
+                clicked,
+                button_top: px(95.),
+            }
+        });
+
+        click_a11y_button(cx, AnyWindowHandle::from(window), px(95.));
+        assert_eq!(*clicked.borrow(), ["clipped"]);
+
+    }
+
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,
         anonymous_paint_count: Rc<Cell<usize>>,
