@@ -1403,6 +1403,13 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set whether this element disallows input, e.g. a disabled control or a
+    /// disabled group of controls (maps to AccessKit's `Disabled` flag).
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = Some(disabled);
+        self
+    }
+
     /// Set the numeric value for this element.
     fn aria_numeric_value(mut self, value: f64) -> Self {
         self.interactivity().aria.numeric_value = Some(value);
@@ -2109,6 +2116,7 @@ static NO_ARIA: AriaProperties = AriaProperties {
     selected: None,
     expanded: None,
     toggled: None,
+    disabled: None,
     numeric_value: None,
     min_numeric_value: None,
     max_numeric_value: None,
@@ -2202,6 +2210,7 @@ pub(crate) struct AriaProperties {
     pub(crate) selected: Option<bool>,
     pub(crate) expanded: Option<bool>,
     pub(crate) toggled: Option<accesskit::Toggled>,
+    pub(crate) disabled: Option<bool>,
     pub(crate) numeric_value: Option<f64>,
     pub(crate) min_numeric_value: Option<f64>,
     pub(crate) max_numeric_value: Option<f64>,
@@ -3679,6 +3688,13 @@ impl Interactivity {
         }
         if let Some(toggled) = self.aria.toggled {
             node.set_toggled(toggled);
+        }
+        if let Some(disabled) = self.aria.disabled {
+            if disabled {
+                node.set_disabled();
+            } else {
+                node.clear_disabled();
+            }
         }
         if let Some(value) = self.aria.numeric_value {
             node.set_numeric_value(value);
