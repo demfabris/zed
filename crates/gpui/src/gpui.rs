@@ -23,6 +23,7 @@ mod elements;
 mod executor;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
+mod frame_stats;
 mod geometry;
 mod gestures;
 mod global;

@@ -166,6 +166,7 @@ mod any_view {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
+        crate::frame_stats::count(crate::frame_stats::Counter::ViewsRendered);
         let view = view.clone().downcast::<V>().unwrap();
         // Record the view's Render type name so the accessibility debug dump can
         // attribute nodes to the view that produced them.
@@ -225,6 +226,7 @@ impl<T: Render> View for Entity<T> {
     #[inline]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         self.update(cx, |this, cx| {
+            crate::frame_stats::count(crate::frame_stats::Counter::ViewsRendered);
             Render::render(this, window, cx).into_any_element()
         })
     }

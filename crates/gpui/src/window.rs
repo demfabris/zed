@@ -1217,7 +1217,10 @@ impl Frame {
             }
         }
 
-        self.scene.finish();
+        {
+            let _frame_stats = crate::frame_stats::phase(crate::frame_stats::Phase::SceneFinish);
+            self.scene.finish();
+        }
     }
 }
 
@@ -3475,6 +3478,12 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let _frame_stats = crate::frame_stats::begin_draw(
+            self.handle.window_id().as_u64(),
+            self.viewport_size.width.0,
+            self.viewport_size.height.0,
+            self.scale_factor,
+        );
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3557,11 +3566,18 @@ impl Window {
                 });
         }
 
+        crate::frame_stats::layout_nodes(|| {
+            self.layout_engine
+                .as_ref()
+                .unwrap()
+                .frame_stats_layout_node_count()
+        });
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.global_ids.finish_frame();
         self.glyph_lookup_cache.get_mut().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        crate::frame_stats::scene(&self.next_frame.scene, self.next_frame.hitboxes.len());
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3670,7 +3686,9 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        let frame_stats = crate::frame_stats::begin_present(self.handle.window_id().as_u64());
         self.platform_window.draw(&self.rendered_frame.scene);
+        drop(frame_stats);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3733,6 +3751,7 @@ impl Window {
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
+        let _frame_stats_prepaint = crate::frame_stats::phase(crate::frame_stats::Phase::Prepaint);
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
@@ -3803,6 +3822,7 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        let _frame_stats_paint = crate::frame_stats::phase(crate::frame_stats::Phase::Paint);
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -5621,6 +5641,7 @@ impl Window {
         available_space: Size<AvailableSpace>,
         cx: &mut App,
     ) {
+        let _frame_stats = crate::frame_stats::phase(crate::frame_stats::Phase::RequestLayout);
         self.invalidator.debug_assert_prepaint();
 
         let mut layout_engine = self.layout_engine.take().unwrap();

@@ -742,6 +742,12 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
     }
 }
 
+impl TaffyLayoutEngine {
+    pub(crate) fn frame_stats_layout_node_count(&self) -> usize {
+        self.taffy.total_node_count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

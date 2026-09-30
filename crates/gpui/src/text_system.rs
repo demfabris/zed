@@ -246,6 +246,7 @@ pub struct TextSystem {
 impl TextSystem {
     /// Create a new TextSystem with the given platform text system.
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
+        let platform_text_system = crate::frame_stats::text_system(platform_text_system);
         let (sender, receiver) = async_channel::bounded(MAX_REPORTED_MISSING_GLYPHS);
         let missing_glyph_generation = Arc::<AtomicUsize>::default();
         TextSystem {

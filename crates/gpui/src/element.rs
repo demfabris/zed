@@ -384,6 +384,8 @@ impl<E: Element> Drawable<E> {
     }
 
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
+        let _frame_stats =
+            crate::frame_stats::element_phase(crate::frame_stats::Phase::RequestLayout);
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Start => {
                 let global_id = self
@@ -431,6 +433,7 @@ impl<E: Element> Drawable<E> {
     }
 
     pub(crate) fn prepaint(&mut self, window: &mut Window, cx: &mut App) {
+        let _frame_stats = crate::frame_stats::element_phase(crate::frame_stats::Phase::Prepaint);
         match mem::take(&mut self.phase) {
             ElementDrawPhase::RequestLayout {
                 layout_id,
@@ -553,6 +556,7 @@ impl<E: Element> Drawable<E> {
         window: &mut Window,
         cx: &mut App,
     ) -> (E::RequestLayoutState, E::PrepaintState) {
+        let _frame_stats = crate::frame_stats::element_phase(crate::frame_stats::Phase::Paint);
         match mem::take(&mut self.phase) {
             ElementDrawPhase::Prepaint {
                 node_id,
