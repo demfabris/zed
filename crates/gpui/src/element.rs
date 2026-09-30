@@ -38,11 +38,13 @@ use crate::{
     FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
     util::FluentBuilder, window::with_element_arena,
 };
-use derive_more::{Deref, DerefMut};
+use derive_more::Deref;
 use std::{
     any::Any,
     fmt::{self, Debug, Display},
-    mem, panic,
+    mem,
+    ops::DerefMut,
+    panic,
     sync::Arc,
 };
 
@@ -211,8 +213,57 @@ pub trait ParentElement {
 }
 
 /// A globally unique identifier for an element, used to track state across frames.
-#[derive(Deref, DerefMut, Clone, Default, Debug, Eq, PartialEq, Hash)]
-pub struct GlobalElementId(pub(crate) Arc<[ElementId]>);
+#[derive(Deref, Clone, Debug)]
+pub struct GlobalElementId(#[deref] pub(crate) Arc<[ElementId]>, u64);
+
+impl GlobalElementId {
+    pub(crate) fn new(path: Arc<[ElementId]>) -> Self {
+        let hash = Self::hash_path(&path);
+        Self(path, hash)
+    }
+
+    fn hash_path(path: &[ElementId]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = collections::FxHasher::default();
+        path.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn path_hash(&self) -> u64 {
+        if self.1 == 0 {
+            Self::hash_path(&self.0)
+        } else {
+            self.1
+        }
+    }
+}
+
+impl Default for GlobalElementId {
+    fn default() -> Self {
+        Self::new(Arc::from([]))
+    }
+}
+
+impl DerefMut for GlobalElementId {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.1 = 0;
+        &mut self.0
+    }
+}
+
+impl PartialEq for GlobalElementId {
+    fn eq(&self, other: &Self) -> bool {
+        self.path_hash() == other.path_hash() && self.0 == other.0
+    }
+}
+
+impl Eq for GlobalElementId {}
+
+impl std::hash::Hash for GlobalElementId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.path_hash());
+    }
+}
 
 impl Display for GlobalElementId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -230,7 +281,7 @@ impl GlobalElementId {
     pub(crate) fn accesskit_node_id(&self) -> accesskit::NodeId {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::default();
-        self.hash(&mut hasher);
+        self.0.hash(&mut hasher);
         accesskit::NodeId(hasher.finish())
     }
 }
@@ -796,7 +847,7 @@ impl Element for Empty {
 #[inline(never)]
 fn prepare_element_id(element_id: ElementId, window: &mut Window) -> GlobalElementId {
     window.element_id_stack.push(element_id);
-    GlobalElementId(Arc::from(&*window.element_id_stack))
+    GlobalElementId::new(Arc::from(&*window.element_id_stack))
 }
 
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -806,8 +857,66 @@ fn prepare_inspector_id(
     window: &mut Window,
 ) -> InspectorElementId {
     let path = InspectorElementPath {
-        global_id: GlobalElementId(Arc::from(&*window.element_id_stack)),
+        global_id: GlobalElementId::new(Arc::from(&*window.element_id_stack)),
         source_location: source,
     };
     window.build_inspector_element_id(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+
+    fn path(ids: &[&'static str]) -> GlobalElementId {
+        GlobalElementId::new(ids.iter().map(|id| ElementId::from(*id)).collect())
+    }
+
+    fn hash(id: &GlobalElementId) -> u64 {
+        BuildHasherDefault::<collections::FxHasher>::default().hash_one(id)
+    }
+
+    #[test]
+    fn global_ids_compare_and_hash_by_path() {
+        let a = path(&["root", "table", "row"]);
+        let b = path(&["root", "table", "row"]);
+        assert_eq!(a, b);
+        assert_eq!(hash(&a), hash(&b));
+
+        let c = path(&["root", "table", "cell"]);
+        assert_ne!(a, c);
+
+        let mut forged = c;
+        forged.1 = a.1;
+        assert_ne!(a, forged);
+        assert_eq!(GlobalElementId::default(), path(&[]));
+    }
+
+    #[test]
+    fn mutable_global_id_paths_invalidate_the_cached_hash() {
+        let mut id = path(&["root", "table", "row"]);
+        let replacement = path(&["root", "table", "cell"]);
+        *id = replacement.0.clone();
+        assert_eq!(id, replacement);
+        assert_eq!(hash(&id), hash(&replacement));
+        assert_eq!(id.accesskit_node_id(), replacement.accesskit_node_id());
+
+        let mut uncached = replacement.clone();
+        uncached.1 = 0;
+        assert_eq!(uncached, replacement);
+        assert_eq!(hash(&uncached), hash(&replacement));
+    }
+
+    #[test]
+    fn global_id_accessibility_ids_keep_the_original_path_hash() {
+        let first = path(&["root", "table", "row"]);
+        let next_frame = path(&["root", "table", "row"]);
+        let mut hasher = std::hash::DefaultHasher::default();
+        first.0.hash(&mut hasher);
+        assert_eq!(
+            first.accesskit_node_id(),
+            accesskit::NodeId(hasher.finish())
+        );
+        assert_eq!(first.accesskit_node_id(), next_frame.accesskit_node_id());
+    }
 }
