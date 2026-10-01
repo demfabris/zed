@@ -140,6 +140,7 @@ struct Frame {
     draw: Timing,
     phases: Phases,
     counts: Counts,
+    accessibility_active: bool,
 }
 
 #[derive(Serialize)]
@@ -259,6 +260,7 @@ pub(crate) fn begin_draw(
                     draw: Timing::zero(started.cpu.is_some()),
                     phases: Phases::new(started.cpu.is_some()),
                     counts: Counts::default(),
+                    accessibility_active: false,
                 },
                 started,
                 phase: None,
@@ -373,6 +375,16 @@ pub(crate) fn count(counter: Counter) {
                 match counter {
                     Counter::ViewsRendered => active.frame.counts.views_rendered += 1,
                 }
+            }
+        });
+    }
+}
+
+pub(crate) fn accessibility_active(active: bool) {
+    if output_path().is_some() {
+        RECORDER.with_borrow_mut(|recorder| {
+            if let Some(frame) = recorder.active.as_mut() {
+                frame.frame.accessibility_active = active;
             }
         });
     }
@@ -567,6 +579,7 @@ mod tests {
                 draw: Timing::zero(true),
                 phases: Phases::new(true),
                 counts: Counts::default(),
+                accessibility_active: false,
             },
             started: start,
             phase: None,

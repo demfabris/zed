@@ -3754,6 +3754,7 @@ impl Window {
         let _frame_stats_prepaint = crate::frame_stats::phase(crate::frame_stats::Phase::Prepaint);
 
         self.a11y.sync_active_flag();
+        crate::frame_stats::accessibility_active(self.a11y.is_active());
         if self.a11y.is_active() {
             self.a11y.begin_frame();
         }
