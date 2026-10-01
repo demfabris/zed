@@ -72,6 +72,7 @@ struct MacTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    sized_fonts: HashMap<(FontId, u32), CTFont>,
 }
 
 impl MacTextSystem {
@@ -85,6 +86,7 @@ impl MacTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            sized_fonts: HashMap::default(),
         }))
     }
 }
@@ -558,6 +560,24 @@ impl MacTextSystemState {
         }
     }
 
+    /// CoreText keeps its shaping caches on the font object, so a font made
+    /// afresh for every line rebuilt them for every line.
+    fn sized_font(&mut self, font_id: FontId, font_size: Pixels) -> CTFont {
+        const MAX_SIZED_FONTS: usize = 1024;
+        let key = (font_id, f32::from(font_size).to_bits());
+        if let Some(font) = self.sized_fonts.get(&key) {
+            return font.clone();
+        }
+        if self.sized_fonts.len() >= MAX_SIZED_FONTS {
+            self.sized_fonts.clear();
+        }
+        let font = self.fonts[font_id.0]
+            .native_font()
+            .clone_with_font_size(f32::from(font_size).into());
+        self.sized_fonts.insert(key, font.clone());
+        font
+    }
+
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         // Construct the attributed string, converting UTF8 ranges to UTF16 ranges.
         let mut string = CFMutableAttributedString::new();
@@ -590,12 +610,9 @@ impl MacTextSystemState {
                 } else {
                     font_size
                 };
+                let native_font = self.sized_font(run.font_id, font_size);
                 unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
+                    string.set_attribute(cf_range, kCTFontAttributeName, &native_font);
                 }
                 break_ligature = !break_ligature;
             }
@@ -614,6 +631,7 @@ impl MacTextSystemState {
                     .unwrap()
             };
             let font_id = self.id_for_native_font(font);
+            let is_emoji = self.is_emoji(font_id);
 
             let glyphs = match runs.last_mut() {
                 Some(run) if run.font_id == font_id => &mut run.glyphs,
@@ -641,7 +659,7 @@ impl MacTextSystemState {
                     id: GlyphId(glyph_id as u32),
                     position: point(position.x as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
-                    is_emoji: self.is_emoji(font_id),
+                    is_emoji,
                 });
             }
         }
@@ -807,6 +825,30 @@ mod tests {
     use super::{synthetic_bold_device_line_width, synthetic_bold_user_space_line_width};
     use crate::MacTextSystem;
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+
+    #[test]
+    fn lines_laid_out_with_kept_fonts_match_the_first_layout() {
+        let fonts = MacTextSystem::new();
+        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
+        let line = "AVAWAY fi ffi 12.5 office";
+        let runs = [5, 3, 4, 5, 8].map(|len| FontRun { font_id, len });
+        let shape = |size| {
+            let layout = fonts.layout_line(line, px(size), &runs);
+            let glyphs = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| (glyph.id, glyph.position)))
+                .collect::<Vec<_>>();
+            (layout.width, glyphs)
+        };
+
+        let first = shape(16.);
+        assert_eq!(shape(16.), first);
+        let larger = shape(24.);
+        assert_ne!(larger.0, first.0);
+        assert_eq!(shape(16.), first);
+        assert_eq!(shape(24.), larger);
+    }
 
     #[test]
     fn synthetic_bold_stays_one_device_pixel_at_retina_scale() {
