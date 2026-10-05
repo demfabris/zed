@@ -339,9 +339,14 @@ fn erf(v: vec2<f32>) -> vec2<f32> {
     return s - s / (r2 * r2);
 }
 
-fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>) -> f32 {
+fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>, corner_smoothing: f32) -> f32 {
   let delta = min(half_size.y - corner - abs(y), 0.0);
-  let curved = half_size.x - corner + sqrt(max(0.0, corner * corner - delta * delta));
+  var arc = sqrt(max(0.0, corner * corner - delta * delta));
+  if (corner_smoothing > 2.001 && corner > 0.0 && corner < min(half_size.x, half_size.y) - 0.01) {
+      let t = min(abs(delta) / corner, 1.0);
+      arc = corner * pow(max(0.0, 1.0 - pow(t, corner_smoothing)), 1.0 / corner_smoothing);
+  }
+  let curved = half_size.x - corner + arc;
   let integral = 0.5 + 0.5 * erf((x + vec2<f32>(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;
 }
@@ -1026,7 +1031,6 @@ struct Shadow {
     element_corner_radii: Corners,
     // 0 = drop shadow, 1 = inset shadow.
     inset: u32,
-    // Superellipse exponent for the corners; only honored when unblurred.
     corner_smoothing: f32,
 }
 
@@ -1094,7 +1098,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         alpha = 0.0;
         for (var i = 0; i < 4; i += 1) {
             let blur = blur_along_x(center_to_point.x, center_to_point.y - y,
-                shadow.blur_radius, corner_radius, half_size);
+                shadow.blur_radius, corner_radius, half_size, shadow.corner_smoothing);
             alpha +=  blur * gaussian(y, shadow.blur_radius) * step;
             y += step;
         }

@@ -34,7 +34,7 @@ float quad_sdf_impl(float2 center_to_point, float corner_radius,
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
+                   float2 half_size, float corner_smoothing);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
@@ -551,7 +551,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha = 0.;
     for (int i = 0; i < 4; i++) {
       alpha += blur_along_x(point.x, point.y - y, shadow.blur_radius,
-                            corner_radius, half_size) *
+                            corner_radius, half_size, shadow.corner_smoothing) *
                gaussian(y, shadow.blur_radius) * step;
       y += step;
     }
@@ -1165,10 +1165,14 @@ float2 erf(float2 x) {
 }
 
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size) {
+                   float2 half_size, float corner_smoothing) {
   float delta = min(half_size.y - corner - abs(y), 0.);
-  float curved =
-      half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
+  float arc = sqrt(max(0., corner * corner - delta * delta));
+  if (corner_smoothing > 2.001 && corner > 0. && corner < min(half_size.x, half_size.y) - 0.01) {
+    float t = min(abs(delta) / corner, 1.);
+    arc = corner * pow(max(0., 1. - pow(t, corner_smoothing)), 1. / corner_smoothing);
+  }
+  float curved = half_size.x - corner + arc;
   float2 integral =
       0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;

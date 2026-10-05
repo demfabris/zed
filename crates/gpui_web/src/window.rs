@@ -30,6 +30,7 @@ pub(crate) struct WebWindowCallbacks {
 
 pub(crate) struct WebWindowMutableState {
     pub(crate) renderer: WgpuRenderer,
+    background_appearance: WindowBackgroundAppearance,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) scale_factor: f32,
     pub(crate) max_texture_dimension: u32,
@@ -163,6 +164,7 @@ impl WebWindow {
 
         let mutable_state = WebWindowMutableState {
             renderer,
+            background_appearance: WindowBackgroundAppearance::Opaque,
             bounds: initial_bounds,
             scale_factor: dpr,
             max_texture_dimension,
@@ -680,7 +682,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
-        WindowBackgroundAppearance::Opaque
+        self.inner.state.borrow().background_appearance
     }
 
     fn set_title(&mut self, title: &str) {
@@ -690,7 +692,16 @@ impl PlatformWindow for WebWindow {
         }
     }
 
-    fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+    fn set_background_appearance(&self, background: WindowBackgroundAppearance) {
+        let mut state = self.inner.state.borrow_mut();
+        if state.background_appearance == background {
+            return;
+        }
+        state.background_appearance = background;
+        state
+            .renderer
+            .update_transparency(background != WindowBackgroundAppearance::Opaque);
+    }
 
     fn minimize(&self) {
         log::warn!("WebWindow::minimize is not supported in the browser");
